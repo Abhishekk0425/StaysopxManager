@@ -8,6 +8,7 @@
  *  3. Deploy → New deployment → Web app → Execute as: Me, Access: Anyone. Copy the /exec URL.
  *  4. Paste the URL into CONFIG.API_URL at the top of script.js.
  *  5. Add time-driven triggers for dailyScheduler (daily, early morning) and markOverdueTickets (hourly).
+ *  6. Run authorizeEmail() once so the "Forgot access code?" emails can be sent.
  */
 
 var DB = {
@@ -86,12 +87,13 @@ function doPost(e) {
     var p = req.payload || {};
     var user = null;
 
-    if (action !== 'login') {
+    var publicActions = ['login', 'requestReset', 'resetPassword'];   // usable before signing in
+    if (publicActions.indexOf(action) === -1) {
       user = validateToken(req.token);
       if (!user) return json({ ok: false, error: 'SESSION_EXPIRED', message: 'Your session has expired. Please sign in again.' });
     }
 
-    var adminOnly = ['createTicket','updateTicket','cancelTicket','createRecurring','updateRecurring','listUsers','addUser','updateUser','adminKPIs','listAllEOD','updateSetting','reportData'];
+    var adminOnly = ['updateTicket','createRecurring','updateRecurring','listUsers','addUser','updateUser','adminKPIs','listAllEOD','updateSetting','reportData'];
     if (adminOnly.indexOf(action) !== -1 && user.role !== 'Admin') {
       return json({ ok: false, error: 'FORBIDDEN', message: 'You do not have permission to perform this action.' });
     }
@@ -99,6 +101,8 @@ function doPost(e) {
     var out;
     switch (action) {
       case 'login':            out = login(p); break;
+      case 'requestReset':     out = requestReset(p); break;
+      case 'resetPassword':    out = resetPassword(p); break;
       case 'bootstrap':        out = bootstrap(user); break;
       case 'listTickets':      out = listTickets(user, p); break;
       case 'getTicket':        out = getTicket(user, p); break;
@@ -113,7 +117,7 @@ function doPost(e) {
       case 'submitEOD':        out = submitEOD(user, p); break;
       case 'myEOD':            out = myEOD(user); break;
       case 'listAllEOD':       out = listAllEOD(user, p); break;
-      case 'adminKPIs':        out = adminKPIs(); break;
+      case 'adminKPIs':        out = adminKPIs(user); break;
       case 'employeeKPIs':     out = employeeKPIs(user); break;
       case 'reportData':       out = reportData(p); break;
       case 'listUsers':        out = listUsers(); break;
@@ -165,6 +169,110 @@ function validateToken(token) {
   if (!raw) return null;
   CacheService.getScriptCache().put('tok_' + token, raw, 21600); // sliding expiry
   return JSON.parse(raw);
+}
+
+/* ------------------------------------------------------------
+ * FORGOT ACCESS CODE — emailed 6-digit code
+ *   requestReset  : emails a one-time code to the address on file
+ *   resetPassword : checks the code and saves the new access code
+ * The code lives in the script cache only (never in the sheet), is valid for
+ * 10 minutes, and is thrown away after 5 wrong tries.
+ * ------------------------------------------------------------ */
+var RESET_MINUTES = 10;
+var RESET_MAX_TRIES = 5;
+var RESET_MIN_LENGTH = 6;
+
+function findUserByEmail(email) {
+  return rows(DB.USERS).filter(function(r) {
+    return String(r['Email']).trim().toLowerCase() === email;
+  })[0];
+}
+
+function requestReset(p) {
+  var email = String(p.email || '').trim().toLowerCase();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new Error('!Enter your work email.');
+
+  var cache = CacheService.getScriptCache();
+  if (cache.get('rst_wait_' + email)) throw new Error('!A code was just sent. Wait a minute before asking for another.');
+  cache.put('rst_wait_' + email, '1', 60);
+
+  // Same reply whether or not the email is registered, so this screen can't be used to find out who has an account.
+  var reply = { sent: true, minutes: RESET_MINUTES };
+  var u = findUserByEmail(email);
+  if (!u || String(u['Status']) !== 'Active') return reply;
+
+  var otp = ('000000' + (parseInt(Utilities.getUuid().replace(/-/g, '').slice(0, 8), 16) % 1000000)).slice(-6);
+  cache.put('rst_' + email, JSON.stringify({ otp: otp, tries: 0, exp: Date.now() + RESET_MINUTES * 60000 }), RESET_MINUTES * 60);
+
+  var app = settingsMap()['APP_NAME'] || 'Stayopx Manager';
+  try {
+    MailApp.sendEmail({
+      to: String(u['Email']).trim(),
+      name: app,
+      subject: 'Your ' + app + ' reset code: ' + otp,
+      body: 'Hi ' + u['Name'] + ',\n\nUse this code to set a new access code for ' + app + ':\n\n    ' + otp +
+        '\n\nIt is valid for ' + RESET_MINUTES + ' minutes and can be used once.\n' +
+        'If you did not ask for this, you can ignore this email. Your access code has not changed.\n',
+      htmlBody: '<div style="font-family:Arial,sans-serif;font-size:15px;color:#1B2430;line-height:1.5">' +
+        '<p>Hi ' + htmlEsc(u['Name']) + ',</p><p>Use this code to set a new access code for ' + htmlEsc(app) + ':</p>' +
+        '<p style="font-size:28px;font-weight:bold;letter-spacing:6px;margin:18px 0">' + otp + '</p>' +
+        '<p>It is valid for ' + RESET_MINUTES + ' minutes and can be used once.</p>' +
+        '<p style="color:#55606E">If you did not ask for this, you can ignore this email. Your access code has not changed.</p></div>'
+    });
+  } catch (err) {
+    console.error('Reset email failed: ' + err);
+    cache.remove('rst_' + email);
+    throw new Error('!We could not send the email right now. Ask your admin to set a new access code for you.');
+  }
+  return reply;
+}
+
+function resetPassword(p) {
+  var email = String(p.email || '').trim().toLowerCase();
+  var otp = String(p.otp || '').replace(/\s/g, '');
+  var newCode = String(p.newCode || '').trim();
+  if (!email || !otp) throw new Error('!Enter the 6-digit code from the email.');
+  if (newCode.length < RESET_MIN_LENGTH) throw new Error('!Your new access code must be at least ' + RESET_MIN_LENGTH + ' characters.');
+
+  var wrong = '!That code is wrong or has expired. Ask for a new one.';
+  var lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    var cache = CacheService.getScriptCache();
+    var raw = cache.get('rst_' + email);
+    if (!raw) throw new Error(wrong);
+    var rec = JSON.parse(raw);
+    if (Date.now() > rec.exp) { cache.remove('rst_' + email); throw new Error(wrong); }
+
+    if (rec.otp !== otp) {
+      rec.tries++;
+      if (rec.tries >= RESET_MAX_TRIES) cache.remove('rst_' + email);
+      else cache.put('rst_' + email, JSON.stringify(rec), Math.max(1, Math.ceil((rec.exp - Date.now()) / 1000)));
+      throw new Error(wrong);
+    }
+
+    var u = findUserByEmail(email);
+    if (!u || String(u['Status']) !== 'Active') { cache.remove('rst_' + email); throw new Error(wrong); }
+    updateRowObj(DB.USERS, u._row, { 'Access Code': newCode });
+    cache.remove('rst_' + email);
+    return { done: true };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function htmlEsc(s) {
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+/**
+ * Run this ONCE from the Apps Script editor after pasting this version.
+ * Google will ask for permission to send email on your behalf. Nothing is sent.
+ */
+function authorizeEmail() {
+  var left = MailApp.getRemainingDailyQuota();
+  console.log('Email is authorized. Emails left today: ' + left);
+  return left;
 }
 
 function bootstrap(user) {
@@ -292,7 +400,18 @@ function requireFields(p, fields) {
 }
 
 function createTicket(user, p) {
+  // Employees can raise tickets, but only for themselves, and only one-time ones.
+  var self = user.role !== 'Admin';
+  if (self) {
+    p.assignedTo = user.id;
+    p.parentId = '';
+    p.ticketType = 'One-Time';
+    if (!p.department) p.department = user.department || '';
+  }
   requireFields(p, ['title', 'assignedTo', 'priority', 'scheduledDate']);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(p.scheduledDate))) throw new Error('!Pick a valid scheduled date.');
+  if (p.dueDate && String(p.dueDate) < String(p.scheduledDate)) throw new Error('!The due date cannot be before the scheduled date.');
+  if (String(p.title).length > 200) throw new Error('!Keep the title under 200 characters.');
   var id = nextId('TKT-', 'seq_ticket', 10001);
   appendRowObj(DB.TICKETS, {
     'Ticket ID': id,
@@ -312,7 +431,7 @@ function createTicket(user, p) {
     'Updated Date': nowStamp(),
     'Completed Date': ''
   });
-  logActivity(id, user.name, '', 'Open', 'Ticket created by ' + user.name);
+  logActivity(id, user.name, '', 'Open', (p.assignedTo === user.id ? 'Self-created by ' : 'Ticket created by ') + user.name);
   return { id: id };
 }
 
@@ -353,6 +472,11 @@ function addComment(user, p) {
 
 function cancelTicket(user, p) {
   var t = findTicket(p.id);
+  if (user.role !== 'Admin') {
+    // an employee may withdraw only a ticket they raised for themselves, and only before it is completed
+    if (t['Created By'] !== user.id || t['Assigned To'] !== user.id) throw new Error('!You can only cancel tickets you created yourself.');
+    if (t['Status'] === 'Completed') throw new Error('!A completed ticket cannot be cancelled.');
+  }
   updateRowObj(DB.TICKETS, t._row, { 'Status': 'Cancelled', 'Updated Date': nowStamp() });
   logActivity(p.id, user.name, t['Status'], 'Cancelled', 'Ticket cancelled by ' + user.name);
   return { id: p.id };
@@ -506,7 +630,9 @@ function submitEOD(user, p) {
     return r['Employee ID'] === user.id && r['Date'] === date;
   })[0];
 
-  var mine = scopeTickets(user).filter(function(t) { return t['Scheduled Date'] === date; });
+  var mine = rows(DB.TICKETS).filter(function(t) {
+    return t['Assigned To'] === user.id && t['Scheduled Date'] === date && t['Status'] !== 'Cancelled';
+  });
   var completed = mine.filter(function(t) { return t['Status'] === 'Completed'; }).length;
 
   var record = {
@@ -562,7 +688,7 @@ function countBy(list, field) {
   return m;
 }
 
-function adminKPIs() {
+function adminKPIs(user) {
   var all = rows(DB.TICKETS).filter(function(t) { return t['Status'] !== 'Cancelled'; });
   var t = today();
   var todays = all.filter(function(x) { return x['Scheduled Date'] === t; });
@@ -607,6 +733,7 @@ function adminKPIs() {
     byEmployee: byEmp,
     weekSeries: series,
     eodSubmitted: submittedIds.length,
+    eodSubmittedToday: !!user && submittedIds.indexOf(user.id) !== -1,
     eodPending: users.filter(function(u) { return submittedIds.indexOf(u['User ID']) === -1; }).map(function(u) { return u['Name']; })
   };
 }

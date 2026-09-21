@@ -5,11 +5,14 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Stayopx Manager — Tickets &amp; Work Logs</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<script>try{document.documentElement.setAttribute("data-theme",localStorage.getItem("od_theme")||"dark")}catch(e){document.documentElement.setAttribute("data-theme","dark")}</script>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
+<div class="top-loader" aria-hidden="true"></div>
 
 <!-- ============ LOGIN ============ -->
 <div id="loginScreen" class="login-screen">
@@ -21,14 +24,14 @@
         <p>UniLiv · Tickets, schedules &amp; daily work logs</p>
       </div>
     </div>
-    <div class="login-form">
+    <div class="login-form" id="loginForm">
       <label>Work email
         <input type="email" id="loginEmail" placeholder="you@company.com" autocomplete="email">
       </label>
-      <label>Access code
+      <label class="tight">Access code
         <span class="pw-wrap">
           <input type="password" id="loginCode" placeholder="Your access code" autocomplete="current-password">
-          <button type="button" class="pw-toggle" id="pwToggle" onclick="togglePassword()" aria-label="Show access code" aria-pressed="false" title="Show access code">
+          <button type="button" class="pw-toggle" id="pwToggle" onclick="toggleCode('loginCode','pwToggle')" aria-label="Show access code" aria-pressed="false" title="Show access code">
             <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>
               <line class="pw-slash" x1="4" y1="4" x2="20" y2="20"/>
@@ -36,8 +39,40 @@
           </button>
         </span>
       </label>
+      <p class="login-help"><button type="button" class="link-btn" onclick="showReset()">Forgot access code?</button></p>
       <button class="btn btn-primary btn-block" id="loginBtn" onclick="doLogin()">Sign in</button>
       <p class="login-error" id="loginError"></p>
+    </div>
+
+    <!-- forgot access code: email a 6-digit code, then set a new access code -->
+    <div class="login-form hidden" id="resetForm">
+      <h2 class="reset-title">Reset your access code</h2>
+      <p class="muted small reset-intro" id="resetIntro"></p>
+      <label>Work email
+        <input type="email" id="resetEmail" placeholder="you@company.com" autocomplete="email">
+      </label>
+      <div class="hidden" id="resetStep2">
+        <label>6-digit code from the email
+          <input type="text" id="resetOtp" inputmode="numeric" maxlength="7" placeholder="123456" autocomplete="one-time-code">
+        </label>
+        <label>New access code
+          <span class="pw-wrap">
+            <input type="password" id="resetNewCode" placeholder="At least 6 characters" autocomplete="new-password">
+            <button type="button" class="pw-toggle" id="resetToggle" onclick="toggleCode('resetNewCode','resetToggle')" aria-label="Show access code" aria-pressed="false" title="Show access code">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>
+              <line class="pw-slash" x1="4" y1="4" x2="20" y2="20"/>
+            </svg>
+            </button>
+          </span>
+        </label>
+      </div>
+      <button class="btn btn-primary btn-block" id="resetBtn" onclick="doReset()">Email me a reset code</button>
+      <p class="login-error" id="resetMsg"></p>
+      <p class="login-links">
+        <button type="button" class="link-btn" onclick="showLogin()">Back to sign in</button>
+        <button type="button" class="link-btn hidden" id="resendBtn" onclick="sendResetCode()">Send a new code</button>
+      </p>
     </div>
   </div>
 </div>
@@ -55,14 +90,15 @@
 
   <main class="main">
     <header class="topbar">
-      <button class="icon-btn menu-btn" onclick="toggleSidebar(true)" aria-label="Open menu">☰</button>
+      <button class="icon-btn menu-btn" onclick="toggleSidebar(true)" aria-label="Open menu"><svg class="ico" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
       <h2 class="topbar-title" id="viewTitle">Dashboard</h2>
       <div class="topbar-right">
+        <button class="icon-btn" id="themeBtn" onclick="toggleTheme()" aria-label="Switch theme"></button>
         <div class="notif-wrap">
-          <button class="icon-btn" id="notifBtn" onclick="toggleNotifs()" aria-label="Notifications">🔔<span class="notif-dot hidden" id="notifDot"></span></button>
+          <button class="icon-btn" id="notifBtn" onclick="toggleNotifs()" aria-label="Notifications"><svg class="ico" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9a6 6 0 0 1 12 0c0 6 2.5 7.5 2.5 7.5h-17S6 15 6 9z"/><path d="M10 20a2 2 0 0 0 4 0"/></svg><span class="notif-dot hidden" id="notifDot"></span></button>
           <div class="notif-panel hidden" id="notifPanel"></div>
         </div>
-        <button class="btn btn-ghost" onclick="refreshView()" title="Refresh data">↻<span class="refresh-label"> Refresh</span></button>
+        <button class="btn btn-ghost" onclick="refreshView()" title="Refresh data"><svg class="ico refresh-ico" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19.25 15.4a8 8 0 1 1-2.1-9.5L20 9"/><path d="M20 4v5h-5"/></svg><span class="refresh-label">Refresh</span></button>
         <div class="profile-wrap">
           <button class="profile-btn" id="profileBtn" onclick="toggleProfile()" aria-haspopup="true" aria-expanded="false" aria-label="Your profile">
             <span class="avatar" id="userAvatar">?</span>
@@ -81,7 +117,7 @@
               <div><dt>Role</dt><dd id="userRole">—</dd></div>
               <div><dt>Department</dt><dd id="userDept">—</dd></div>
             </dl>
-            <button class="btn profile-logout" onclick="logout()">Log out</button>
+            <button class="btn profile-logout" onclick="logout()"><svg class="ico" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h4"/><path d="M15 8l4 4-4 4M19 12H9"/></svg>Log out</button>
           </div>
         </div>
       </div>

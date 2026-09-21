@@ -10,25 +10,29 @@ Live app: _add your link here_
 
 - Create and assign tickets with priority, department, scheduled date and time, and due date
 - Set up recurring tickets (daily, weekly, monthly) that are generated automatically every morning
-- Dashboard with today's progress, overdue tickets (oldest first), team workload per person, and who has not submitted their EOD log
+- Dashboard with a one-line summary of the day, today's progress, overdue tickets (oldest first), active work by priority, team workload per person, what is coming up today, and who has not submitted their EOD log
 - Click any dashboard card or team member to open the matching ticket list
-- Review EOD logs by date and employee
+- Review the team's EOD logs by date and employee, and submit their own EOD log
 - Reports by employee and department, with CSV export
 - Add, deactivate and reactivate team members
 - Change statuses, priorities, departments and the EOD cutoff time from Settings
 
 **For employees**
 
-- Dashboard with today's tasks, progress, and unfinished work carried over from earlier days
+- Dashboard with today's progress, the next task to work on, and unfinished work carried over from earlier days
+- Create tickets for themselves for work nobody assigned (marked "Self-created" so managers can see it), and cancel those tickets if raised by mistake
 - Start and complete tickets in one click, change status, add comments
-- Submit one end-of-day work log per day, editable until the cutoff (default 11:00 PM)
+- Submit one end-of-day work log per day, editable until the cutoff (default 11:00 PM), with a button that fills in today's ticket titles
 - In-app alerts for new tickets, tasks due within the hour, overdue tickets and a pending EOD log
+- Reset a forgotten access code from the login screen, using a 6-digit code sent to their work email
 
 **Built in**
 
 - Every status change and comment is kept in an activity timeline that is never overwritten
 - Tickets past their due date and time are marked Overdue automatically, every hour
-- Employees can only see and update their own tickets; this is checked on the server, not only on screen
+- Employees can only see and update their own tickets, and tickets they create are always assigned to themselves; this is checked on the server, not only on screen
+- Dark and light themes (dark by default, switch from the top bar; to change the default, edit `DEFAULT_THEME` at the top of `script.js` and the matching word in the small script near the top of `index.html`)
+- The dashboard refreshes itself every 5 minutes while it is open
 
 ## How it works
 
@@ -75,6 +79,8 @@ There is no separate server or SQL database. The front end is three static files
 
 **Backend** (`Code.gs`): paste the new code into the Apps Script editor, then **Deploy → Manage deployments → edit → New version → Deploy**. The URL stays the same. Without a new version, the change does not go live.
 
+If the new `Code.gs` uses a Google service the old one did not (the access code reset sends email, for example), run the function `authorizeEmail` once from the editor and accept the permission prompt before deploying the new version.
+
 ## Google Sheet tabs
 
 | Tab | Holds |
@@ -91,6 +97,7 @@ Ticket IDs look like `TKT-10001`, recurring templates `RT-1`, EOD logs `EOD-7000
 ## Security notes
 
 - Access codes are stored as plain text in the Users tab. Share the Google Sheet only with people who should be able to see them.
+- Reset codes are emailed only to the address already on file, last 10 minutes, work once, and are discarded after 5 wrong tries. They are never written to the sheet.
 - Sessions expire after about 6 hours without activity.
 - Deactivated users cannot sign in.
 - If this repository is public, keep `Code.gs` and the setup guide out of it.
@@ -102,6 +109,7 @@ Ticket IDs look like `TKT-10001`, recurring templates `RT-1`, EOD logs `EOD-7000
 | "Backend not configured" | Paste the `/exec` URL into `CONFIG.API_URL` in `script.js` |
 | A valid user cannot sign in | Check that Status is `Active` and the Access Code is filled in the Users tab |
 | Recurring tickets are not appearing | Check that the `dailyScheduler` trigger exists, the template is Active, and today is within its start and end dates |
+| The reset email does not arrive | Check the person's email in the Users tab is a real inbox and their Status is `Active`, look in spam, and confirm `authorizeEmail` was run and a new version deployed. Reset emails are sent from the Google account that owns the script |
 | Times look wrong | Set the Apps Script project time zone and deploy a new version |
 | Changes to `Code.gs` have no effect | Deploy a **New version** |
 | The dashboard looks unchanged after an update | Press Ctrl+F5 |

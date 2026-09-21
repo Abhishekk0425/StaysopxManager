@@ -24,19 +24,87 @@ var state = {
 /* ============================================================
  * API CLIENT
  * ============================================================ */
+/* ============================================================
+ * THEME — change DEFAULT_THEME to 'light' if you want new visitors to start in the light look
+ * ============================================================ */
+var DEFAULT_THEME = 'dark';
+function currentTheme() {
+  try { return localStorage.getItem('od_theme') || DEFAULT_THEME; } catch (e) { return DEFAULT_THEME; }
+}
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  var btn = document.getElementById('themeBtn');
+  if (btn) {
+    btn.innerHTML = icon(theme === 'dark' ? 'sun' : 'moon', 19);
+    btn.title = theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode';
+    btn.setAttribute('aria-label', btn.title);
+  }
+}
+function toggleTheme() {
+  var next = currentTheme() === 'dark' ? 'light' : 'dark';
+  try { localStorage.setItem('od_theme', next); } catch (e) {}
+  applyTheme(next);
+  if (state.charts.length) renderView(true);   // charts read their colours from the theme
+}
+function cssVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+/* thin loading bar at the very top + spinning refresh icon while any request is running */
+var _inflight = 0;
+function setLoading(on) {
+  _inflight = Math.max(0, _inflight + (on ? 1 : -1));
+  document.body.classList.toggle('is-loading', _inflight > 0);
+}
+/* spinner inside a button while it is working */
+function setBusy(btn, busy, label) {
+  btn.disabled = busy;
+  btn.classList.toggle('is-busy', busy);
+  if (label) btn.textContent = label;
+}
+
+function apiError(code, message) { var e = new Error(message); e.code = code; return e; }
+
+/* under a connection error on the login screen: a link that opens the backend directly, so anyone can see what it says */
+function serverCheckHtml() {
+  return ' <a href="' + esc(CONFIG.API_URL) + '" target="_blank" rel="noopener">Test the backend</a>' +
+    '<span class="login-hint">A working backend shows: “Stayopx Manager API is running”. Anything else (a Google sign-in page, ' +
+    '“Authorization is required”, or an error) means the Apps Script has to be fixed, not this page.</span>';
+}
+
 async function api(action, payload) {
   if (CONFIG.API_URL.indexOf('http') !== 0) {
     throw new Error('Backend not configured. Paste your Apps Script URL into CONFIG.API_URL in script.js.');
   }
-  var res = await fetch(CONFIG.API_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // avoids CORS preflight
-    body: JSON.stringify({ action: action, token: state.token, payload: payload || {} })
-  });
-  var out = await res.json();
+  var out, res;
+  setLoading(true);
+  try {
+    try {
+      res = await fetch(CONFIG.API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // avoids CORS preflight
+        body: JSON.stringify({ action: action, token: state.token, payload: payload || {} })
+      });
+    } catch (e) {
+      // Either there is no internet, or Google answered with an error page instead of the app
+      // (the usual reason: the Apps Script was changed but not authorized / redeployed).
+      throw apiError('NO_SERVER', navigator.onLine === false ?
+        'You appear to be offline. Check your internet connection and try again.' :
+        'The backend is not responding. If your internet is working, the Apps Script needs to be authorized or redeployed.');
+    }
+    try {
+      out = await res.json();
+    } catch (e) {
+      throw apiError('BAD_REPLY', 'The backend replied with an error page instead of data. The Apps Script needs to be authorized or redeployed.');
+    }
+  } finally {
+    setLoading(false);
+  }
   if (!out.ok) {
-    if (out.error === 'SESSION_EXPIRED') { logout(true); }
-    throw new Error(out.message || 'Request failed. Please try again.');
+    if (out.error === 'SESSION_EXPIRED' && state.token) { logout(true); }
+    var err = new Error(out.message || 'Request failed. Please try again.');
+    err.code = out.error;
+    throw err;
   }
   return out.data;
 }
@@ -47,8 +115,8 @@ async function api(action, payload) {
 async function doLogin() {
   var btn = document.getElementById('loginBtn');
   var err = document.getElementById('loginError');
-  err.textContent = '';
-  btn.disabled = true; btn.textContent = 'Signing in…';
+  err.textContent = ''; err.classList.remove('ok');
+  setBusy(btn, true, 'Signing in…');
   try {
     var data = await api('login', {
       email: document.getElementById('loginEmail').value,
@@ -59,12 +127,13 @@ async function doLogin() {
     localStorage.setItem('od_user', JSON.stringify(data.user));
     localStorage.setItem('od_settings', JSON.stringify(data.settings));
     document.getElementById('loginCode').value = '';
-    setPasswordVisible(false);
+    setCodeVisible('loginCode', 'pwToggle', false);
     enterApp();
   } catch (e) {
     err.textContent = e.message;
+    if (e.code === 'NO_SERVER' || e.code === 'BAD_REPLY') err.innerHTML = esc(e.message) + serverCheckHtml();
   } finally {
-    btn.disabled = false; btn.textContent = 'Sign in';
+    setBusy(btn, false, 'Sign in');
   }
 }
 
@@ -77,19 +146,109 @@ function logout(expired) {
   if (expired) toast('Your session expired. Please sign in again.', 'error');
 }
 
-/* show / hide the access code on the login screen */
-function setPasswordVisible(show) {
-  var input = document.getElementById('loginCode');
-  var btn = document.getElementById('pwToggle');
+/* show / hide an access-code field (eye button) */
+function setCodeVisible(inputId, btnId, show) {
+  var input = document.getElementById(inputId);
+  var btn = document.getElementById(btnId);
   input.type = show ? 'text' : 'password';
   btn.classList.toggle('on', show);
   btn.setAttribute('aria-pressed', show ? 'true' : 'false');
   btn.setAttribute('aria-label', show ? 'Hide access code' : 'Show access code');
   btn.title = show ? 'Hide access code' : 'Show access code';
 }
-function togglePassword() {
-  setPasswordVisible(document.getElementById('loginCode').type === 'password');
-  document.getElementById('loginCode').focus();
+function toggleCode(inputId, btnId) {
+  setCodeVisible(inputId, btnId, document.getElementById(inputId).type === 'password');
+  document.getElementById(inputId).focus();
+}
+
+/* ============================================================
+ * FORGOT ACCESS CODE
+ * Step 1: email a 6-digit code · Step 2: enter it and choose a new access code
+ * ============================================================ */
+var resetStep = 1;
+
+function showReset() {
+  document.getElementById('loginForm').classList.add('hidden');
+  document.getElementById('resetForm').classList.remove('hidden');
+  document.getElementById('resetEmail').value = document.getElementById('loginEmail').value.trim();
+  setResetStep(1);
+  resetMsg('');
+  document.getElementById('resetEmail').focus();
+}
+
+function showLogin(okMsg) {
+  document.getElementById('resetForm').classList.add('hidden');
+  document.getElementById('loginForm').classList.remove('hidden');
+  document.getElementById('resetOtp').value = '';
+  document.getElementById('resetNewCode').value = '';
+  setCodeVisible('resetNewCode', 'resetToggle', false);
+  var note = document.getElementById('loginError');
+  note.textContent = okMsg || '';
+  note.classList.toggle('ok', !!okMsg);
+}
+
+function setResetStep(n) {
+  resetStep = n;
+  document.getElementById('resetStep2').classList.toggle('hidden', n !== 2);
+  document.getElementById('resendBtn').classList.toggle('hidden', n !== 2);
+  document.getElementById('resetEmail').readOnly = n === 2;
+  document.getElementById('resetBtn').textContent = n === 1 ? 'Email me a reset code' : 'Save new access code';
+  document.getElementById('resetIntro').textContent = n === 1 ?
+    'Enter your work email and we will send you a 6-digit code.' :
+    'If that email is registered, a 6-digit code is on its way. It is valid for 10 minutes. Check spam if you do not see it.';
+}
+
+function resetMsg(text, ok) {
+  var el = document.getElementById('resetMsg');
+  el.textContent = text || '';
+  el.classList.toggle('ok', !!ok);
+}
+
+function doReset() { return resetStep === 1 ? sendResetCode() : saveNewCode(); }
+
+async function sendResetCode() {
+  var email = document.getElementById('resetEmail').value.trim();
+  if (!email) { resetMsg('Enter your work email.'); return; }
+  var btn = document.getElementById('resetBtn');
+  var label = btn.textContent;
+  resetMsg('');
+  setBusy(btn, true, 'Sending…');
+  try {
+    await api('requestReset', { email: email });
+    var again = resetStep === 2;
+    setResetStep(2);
+    if (again) resetMsg('A new code has been sent.', true);
+    document.getElementById('resetOtp').focus();
+  } catch (e) {
+    btn.textContent = label;
+    resetMsg(e.code === 'SESSION_EXPIRED' ?
+      'Reset is not switched on yet. Ask your admin to deploy the latest Code.gs.' : e.message);
+  } finally {
+    setBusy(btn, false);
+    if (btn.textContent === 'Sending…') btn.textContent = resetStep === 1 ? 'Email me a reset code' : 'Save new access code';
+  }
+}
+
+async function saveNewCode() {
+  var email = document.getElementById('resetEmail').value.trim();
+  var otp = document.getElementById('resetOtp').value.trim();
+  var code = document.getElementById('resetNewCode').value.trim();
+  if (!otp) { resetMsg('Enter the 6-digit code from the email.'); return; }
+  if (code.length < 6) { resetMsg('Your new access code must be at least 6 characters.'); return; }
+  var btn = document.getElementById('resetBtn');
+  resetMsg('');
+  setBusy(btn, true, 'Saving…');
+  try {
+    await api('resetPassword', { email: email, otp: otp, newCode: code });
+    document.getElementById('loginEmail').value = email;
+    document.getElementById('loginCode').value = '';
+    showLogin('Access code updated. Sign in with your new code.');
+    document.getElementById('loginCode').focus();
+  } catch (e) {
+    resetMsg(e.message);
+  } finally {
+    setBusy(btn, false, 'Save new access code');
+  }
 }
 
 /* profile menu (top right) */
@@ -128,31 +287,65 @@ async function enterApp() {
 /* ============================================================
  * NAVIGATION
  * ============================================================ */
+/* One consistent line-icon set (replaces the emoji, which look different on every device) */
+var ICONS = {
+  dashboard: '<rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/>',
+  ticket: '<path d="M3 9V7a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v2a3 3 0 0 0 0 6v2a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-2a3 3 0 0 0 0-6z"/><path d="M14 5v3M14 11v2M14 16v3"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  repeat: '<path d="M17 2l4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="M7 22l-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/>',
+  users: '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><path d="M16 4.6a3.5 3.5 0 0 1 0 6.8"/><path d="M18 14.5a6.5 6.5 0 0 1 3.5 5.5"/>',
+  note: '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/><path d="M9 13h6M9 17h4"/>',
+  chart: '<path d="M4 20h16"/><path d="M7 16v-4M12 16V7M17 16v-6"/>',
+  sliders: '<path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/>',
+  sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
+  calendar: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
+  check: '<circle cx="12" cy="12" r="9"/><path d="M8 12.5l2.8 2.8L16 9.5"/>',
+  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+  alert: '<path d="M12 4l9 16H3z"/><path d="M12 10v4M12 17v.5"/>',
+  folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+  pause: '<circle cx="12" cy="12" r="9"/><path d="M10 9v6M14 9v6"/>',
+  activity: '<path d="M3 12h4l3-8 4 16 3-8h4"/>',
+  dot: '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.5"/>',
+  target: '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/>',
+  info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8v.5"/>',
+  xcircle: '<circle cx="12" cy="12" r="9"/><path d="M9 9l6 6M15 9l-6 6"/>',
+  moon: '<path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/>',
+  arrow: '<path d="M5 12h14M13 6l6 6-6 6"/>',
+  wand: '<path d="M5 19L16 8"/><path d="M14 6l4 4"/><path d="M18 3v3M16.5 4.5h3M6 5v2M5 6h2M19 14v2M18 15h2"/>'
+};
+function icon(name, size) {
+  var s = size || 18;
+  return '<svg class="ico" viewBox="0 0 24 24" width="' + s + '" height="' + s + '" fill="none" stroke="currentColor" ' +
+    'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + (ICONS[name] || '') + '</svg>';
+}
+
 var NAV = {
   Admin: [
-    ['dashboard', '▦', 'Dashboard'],
-    ['tickets', '🎫', 'All Tickets'],
-    ['createTicket', '＋', 'Create Ticket'],
-    ['recurring', '↻', 'Recurring Tickets'],
-    ['employees', '👥', 'Employees'],
-    ['eodAdmin', '📝', 'EOD Logs'],
-    ['reports', '📊', 'Reports'],
-    ['settings', '⚙', 'Settings']
+    ['dashboard', 'dashboard', 'Dashboard'],
+    ['tickets', 'ticket', 'All Tickets'],
+    ['createTicket', 'plus', 'Create Ticket'],
+    ['recurring', 'repeat', 'Recurring Tickets'],
+    ['employees', 'users', 'Employees'],
+    ['eodAdmin', 'note', 'Team EOD Logs'],
+    ['eod', 'check', 'My EOD Log'],
+    ['reports', 'chart', 'Reports'],
+    ['settings', 'sliders', 'Settings']
   ],
   Employee: [
-    ['dashboard', '▦', 'Dashboard'],
-    ['tickets', '🎫', 'My Tickets'],
-    ['today', '☀', "Today's Tasks"],
-    ['upcoming', '⏭', 'Upcoming Tasks'],
-    ['completed', '✓', 'Completed'],
-    ['eod', '📝', 'EOD Work Log'],
-    ['history', '🕘', 'My History']
+    ['dashboard', 'dashboard', 'Dashboard'],
+    ['tickets', 'ticket', 'My Tickets'],
+    ['createTicket', 'plus', 'New Ticket'],
+    ['today', 'sun', "Today's Tasks"],
+    ['upcoming', 'calendar', 'Upcoming Tasks'],
+    ['completed', 'check', 'Completed'],
+    ['eod', 'note', 'EOD Work Log'],
+    ['history', 'clock', 'My History']
   ]
 };
 
 var VIEW_TITLES = {
   dashboard: 'Dashboard', tickets: 'Tickets', createTicket: 'Create Ticket',
-  recurring: 'Recurring Tickets', employees: 'Employees', eodAdmin: 'EOD Logs',
+  recurring: 'Recurring Tickets', employees: 'Employees', eodAdmin: 'Team EOD Logs',
   reports: 'Reports', settings: 'Settings', today: "Today's Tasks",
   upcoming: 'Upcoming Tasks', completed: 'Completed Tickets',
   eod: 'EOD Work Log', history: 'My History'
@@ -162,7 +355,7 @@ function buildSidebar() {
   var nav = document.getElementById('sidebarNav');
   nav.innerHTML = NAV[state.user.role].map(function(item) {
     return '<button class="nav-item" data-view="' + item[0] + '" onclick="navigate(\'' + item[0] + '\')">' +
-      '<span class="n-ico">' + item[1] + '</span>' + item[2] + '</button>';
+      '<span class="n-ico">' + icon(item[1]) + '</span>' + item[2] + '</button>';
   }).join('');
 }
 
@@ -182,32 +375,82 @@ function toggleSidebar(open) {
   document.getElementById('sidebar').classList.toggle('open', !!open);
 }
 
-async function renderView() {
+async function renderView(silent) {
   var c = document.getElementById('viewContainer');
-  destroyCharts();
-  c.innerHTML = '<div class="skeleton tall"></div><div class="skeleton"></div><div class="skeleton" style="width:60%"></div>';
+  silent = silent === true;
+  var oldCharts = [];
+  if (silent) { oldCharts = state.charts; state.charts = []; }      // keep the page as it is until fresh data arrives
+  else { destroyCharts(); c.innerHTML = skeletonFor(state.view); }
+  c.classList.toggle('no-anim', silent);
   try {
     var v = state.view;
-    if (v === 'dashboard') return state.user.role === 'Admin' ? renderAdminDashboard(c) : renderEmployeeDashboard(c);
-    if (v === 'tickets') return renderTickets(c, state.viewArg || {});
-    if (v === 'today') return renderTickets(c, { preset: 'today' });
-    if (v === 'upcoming') return renderTickets(c, { preset: 'upcoming' });
-    if (v === 'completed') return renderTickets(c, { preset: 'completed' });
-    if (v === 'history') return renderTickets(c, { preset: 'history' });
-    if (v === 'createTicket') return renderCreateTicket(c);
-    if (v === 'recurring') return renderRecurring(c);
-    if (v === 'employees') return renderEmployees(c);
-    if (v === 'eod') return renderEmployeeEOD(c);
-    if (v === 'eodAdmin') return renderAdminEOD(c);
-    if (v === 'reports') return renderReports(c);
-    if (v === 'settings') return renderSettings(c);
+    if (v === 'dashboard') await (state.user.role === 'Admin' ? renderAdminDashboard(c) : renderEmployeeDashboard(c));
+    else if (v === 'tickets') await renderTickets(c, state.viewArg || {});
+    else if (v === 'today') await renderTickets(c, { preset: 'today' });
+    else if (v === 'upcoming') await renderTickets(c, { preset: 'upcoming' });
+    else if (v === 'completed') await renderTickets(c, { preset: 'completed' });
+    else if (v === 'history') await renderTickets(c, { preset: 'history' });
+    else if (v === 'createTicket') await renderCreateTicket(c);
+    else if (v === 'recurring') await renderRecurring(c);
+    else if (v === 'employees') await renderEmployees(c);
+    else if (v === 'eod') await renderEmployeeEOD(c);
+    else if (v === 'eodAdmin') await renderAdminEOD(c);
+    else if (v === 'reports') await renderReports(c);
+    else if (v === 'settings') await renderSettings(c);
+    if (!silent) animateCounts(c);
   } catch (e) {
-    c.innerHTML = errorState(e.message);
+    if (!silent) c.innerHTML = errorState(e.message);
+    else { state.charts = state.charts.concat(oldCharts); oldCharts = []; }   // failed quietly: leave the old page alone
   }
+  oldCharts.forEach(function(ch) { try { ch.destroy(); } catch (e) {} });
+}
+
+/* the dashboard quietly refreshes itself every 5 minutes while it is open and visible */
+var AUTO_REFRESH_MS = 5 * 60 * 1000;
+setInterval(function() {
+  if (!state.token || state.view !== 'dashboard' || document.hidden || _inflight > 0) return;
+  if (!document.getElementById('modalBackdrop').classList.contains('hidden')) return;
+  renderView(true);
+}, AUTO_REFRESH_MS);
+
+/* loading placeholders shaped like the page that is about to appear */
+function skeletonFor(view) {
+  var block = function(h) { return '<div class="sk" style="height:' + h + 'px"></div>'; };
+  var many = function(n, h) { var s = ''; for (var i = 0; i < n; i++) s += block(h); return s; };
+  if (view === 'dashboard') {
+    return '<div class="sk-wrap" aria-busy="true" aria-label="Loading">' +
+      block(128) + '<div class="two-col">' + many(2, 132) + '</div>' +
+      '<div class="kpi-grid kpi-fit">' + many(state.user && state.user.role === 'Admin' ? 5 : 4, 92) + '</div>' +
+      '<div class="dash-split">' + many(2, 250) + '</div></div>';
+  }
+  if (view === 'createTicket' || view === 'settings' || view === 'eod') {
+    return '<div class="sk-wrap" aria-busy="true" aria-label="Loading">' + block(320) + '</div>';
+  }
+  return '<div class="sk-wrap" aria-busy="true" aria-label="Loading">' +
+    '<div class="sk-row">' + many(4, 38) + '</div>' +
+    '<div class="panel">' + many(6, 44).replace(/class="sk"/g, 'class="sk sk-line"') + '</div></div>';
+}
+
+/* numbers marked data-count tick up from zero once, when a page appears */
+function animateCounts(root) {
+  var els = root.querySelectorAll('[data-count]');
+  if (!els.length) return;
+  if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  var start = null, dur = 650;
+  function frame(ts) {
+    if (start === null) start = ts;
+    var p = Math.min(1, (ts - start) / dur);
+    var eased = 1 - Math.pow(1 - p, 3);
+    els.forEach(function(el) {
+      el.textContent = Math.round(Number(el.dataset.count) * eased) + (el.dataset.suffix || '');
+    });
+    if (p < 1) requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
 }
 
 function errorState(msg) {
-  return '<div class="empty-state"><div class="e-ico">⚠</div><p>' + esc(msg) + '</p>' +
+  return '<div class="empty-state"><div class="e-ico e-warn">' + icon('alert', 24) + '</div><p>' + esc(msg) + '</p>' +
     '<button class="btn btn-ghost" style="margin-top:12px" onclick="renderView()">Try again</button></div>';
 }
 
@@ -243,7 +486,8 @@ function fmtTime(t) {
 }
 function userName(id) {
   var u = state.users.filter(function(x) { return x.id === id; })[0];
-  return u ? u.name : id;
+  if (u) return u.name;
+  return state.user && id === state.user.id ? state.user.name : id;
 }
 function statusBadge(s) {
   var map = { 'Open': 'b-open', 'In Progress': 'b-progress', 'Completed': 'b-done', 'On Hold': 'b-hold', 'Overdue': 'b-late', 'Cancelled': 'b-cancel' };
@@ -271,7 +515,7 @@ function userOptions(selected) {
 function toast(msg, type) {
   var el = document.createElement('div');
   el.className = 'toast' + (type === 'error' ? ' t-error' : type === 'success' ? ' t-success' : '');
-  el.textContent = msg;
+  el.innerHTML = icon(type === 'error' ? 'xcircle' : type === 'success' ? 'check' : 'info', 18) + '<span>' + esc(msg) + '</span>';
   document.getElementById('toastStack').appendChild(el);
   setTimeout(function() { el.remove(); }, 3800);
 }
@@ -308,6 +552,9 @@ function destroyCharts() {
 function makeChart(canvasId, cfg) {
   var el = document.getElementById(canvasId);
   if (!el || typeof Chart === 'undefined') return;
+  Chart.defaults.font.family = "'Instrument Sans', system-ui, sans-serif";
+  Chart.defaults.color = cssVar('--ink-2') || '#55606E';
+  Chart.defaults.borderColor = cssVar('--line') || '#E3E7EC';
   cfg.options = Object.assign({ responsive: true, maintainAspectRatio: false }, cfg.options || {});
   state.charts.push(new Chart(el, cfg));
 }
@@ -322,21 +569,21 @@ function computeNotifs(tickets, eodSubmitted) {
   var notifs = [];
   (tickets || []).forEach(function(tk) {
     if (tk['Status'] === 'Overdue') {
-      notifs.push({ id: 'ovd_' + tk['Ticket ID'], ico: '⏰', text: tk['Ticket ID'] + ' "' + tk['Title'] + '" is overdue.' });
+      notifs.push({ id: 'ovd_' + tk['Ticket ID'], ico: 'alert', tone: 'late', text: tk['Ticket ID'] + ' "' + tk['Title'] + '" is overdue.' });
     } else if (tk['Scheduled Date'] === t && tk['Status'] !== 'Completed' && tk['Scheduled Time']) {
       var p = tk['Scheduled Time'].split(':');
       var due = new Date(); due.setHours(Number(p[0]) || 0, Number(p[1]) || 0, 0, 0);
       var mins = Math.round((due - now) / 60000);
       if (mins > 0 && mins <= 60) {
-        notifs.push({ id: 'due_' + tk['Ticket ID'], ico: '🕐', text: tk['Ticket ID'] + ' "' + tk['Title'] + '" is due in ' + mins + ' min.' });
+        notifs.push({ id: 'due_' + tk['Ticket ID'], ico: 'clock', tone: 'progress', text: tk['Ticket ID'] + ' "' + tk['Title'] + '" is due in ' + mins + ' min.' });
       }
     }
     if (tk['Status'] === 'Open' && String(tk['Created Date']).slice(0, 10) === t) {
-      notifs.push({ id: 'new_' + tk['Ticket ID'], ico: '🎫', text: 'New ticket: ' + tk['Ticket ID'] + ' "' + tk['Title'] + '".' });
+      notifs.push({ id: 'new_' + tk['Ticket ID'], ico: 'ticket', tone: 'open', text: 'New ticket: ' + tk['Ticket ID'] + ' "' + tk['Title'] + '".' });
     }
   });
   if (state.user.role === 'Employee' && eodSubmitted === false && now.getHours() >= 17) {
-    notifs.push({ id: 'eod_' + t, ico: '📝', text: "Your EOD work log for today hasn't been submitted yet." });
+    notifs.push({ id: 'eod_' + t, ico: 'note', tone: 'progress', text: "Your EOD work log for today hasn't been submitted yet." });
   }
   state.notifs = notifs;
   var unseen = notifs.some(function(n) { return !state.notifSeen[n.id]; });
@@ -350,10 +597,10 @@ function toggleNotifs() {
   if (!opening) return;
   closeProfile();
   if (!state.notifs.length) {
-    panel.innerHTML = '<div class="notif-empty">You\'re all caught up.</div>';
+    panel.innerHTML = '<div class="notif-empty"><div class="e-ico e-ok">' + icon('check', 22) + '</div>You\'re all caught up.</div>';
   } else {
     panel.innerHTML = state.notifs.map(function(n) {
-      return '<div class="notif-item"><span class="n-ico">' + n.ico + '</span><span>' + esc(n.text) + '</span></div>';
+      return '<div class="notif-item"><span class="n-ico chip chip-' + n.tone + '">' + icon(n.ico, 16) + '</span><span>' + esc(n.text) + '</span></div>';
     }).join('');
     state.notifs.forEach(function(n) { state.notifSeen[n.id] = 1; });
     localStorage.setItem('od_notif_seen', JSON.stringify(state.notifSeen));
@@ -401,18 +648,81 @@ function oldestFirst(a, b) {
 }
 
 /* clickable KPI card — opens the ticket list already filtered */
-function kpiCard(label, num, cls, sub, key, value) {
+function kpiCard(label, num, cls, sub, key, value, ico) {
+  var n = parseFloat(num), suffix = String(num).indexOf('%') !== -1 ? '%' : '';
   return '<button class="kpi ' + cls + '" onclick="goTickets(\'' + key + '\',\'' + esc(value) + '\')">' +
-    '<div class="k-num">' + num + '</div><div class="k-label">' + esc(label) + '</div>' +
+    (ico ? '<span class="k-chip">' + icon(ico, 17) + '</span>' : '') +
+    '<div class="k-num" data-count="' + n + '" data-suffix="' + suffix + '">' + num + '</div><div class="k-label">' + esc(label) + '</div>' +
     (sub ? '<div class="k-sub">' + esc(sub) + '</div>' : '') + '</button>';
+}
+/* progress ring with the percentage in the middle */
+function progressRing(done, total) {
+  var pct = pctOf(done, total), len = 2 * Math.PI * 26;
+  return '<svg class="ring" viewBox="0 0 64 64" width="76" height="76" role="img" aria-label="' + pct + ' percent">' +
+    '<circle class="ring-track" cx="32" cy="32" r="26"/>' +
+    (pct ? '<circle class="ring-fill" cx="32" cy="32" r="26" stroke-dasharray="' + len.toFixed(1) + '" stroke-dashoffset="' +
+      (len * (1 - pct / 100)).toFixed(1) + '" style="--ring-len:' + len.toFixed(1) + '"/>' : '') +
+    '<text class="ring-text" x="32" y="37" text-anchor="middle">' + pct + '%</text></svg>';
 }
 function progressBar(done, total, small) {
   return '<div class="bar' + (small ? ' bar-sm' : '') + '"><span style="width:' + pctOf(done, total) + '%"></span></div>';
 }
 
 /* ============================================================
+ * DASHBOARD BUILDING BLOCKS
+ * ============================================================ */
+function greeting() {
+  var h = new Date().getHours();
+  return (h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : 'Good evening') + ', ' + String(state.user.name || '').split(/\s+/)[0];
+}
+function plural(n, one, many) { return n + ' ' + (n === 1 ? one : many); }
+
+/* minutes from now until a ticket's scheduled time today (negative = already past); null if it has no time */
+function minutesUntil(tk) {
+  var tm = String(tk['Scheduled Time'] || '');
+  if (!/^\d{1,2}:\d{2}/.test(tm)) return null;
+  var p = tm.split(':'), now = new Date();
+  return (Number(p[0]) * 60 + Number(p[1])) - (now.getHours() * 60 + now.getMinutes());
+}
+function spanLabel(mins) {
+  var m = Math.abs(mins);
+  return m < 60 ? m + ' min' : Math.floor(m / 60) + ' h' + (m % 60 ? ' ' + (m % 60) + ' min' : '');
+}
+function whenLabel(tk) {
+  if (tk['Status'] === 'In Progress') return '<span class="when when-now">In progress</span>';
+  var m = minutesUntil(tk);
+  if (m === null) return '<span class="when">Any time today</span>';
+  if (m >= 0) return '<span class="when' + (m <= 60 ? ' when-soon' : '') + '">in ' + spanLabel(m) + '</span>';
+  return '<span class="when when-past">' + spanLabel(m) + ' ago</span>';
+}
+function byTimeToday(a, b) {
+  return ((b['Status'] === 'In Progress') - (a['Status'] === 'In Progress')) ||
+    (a['Scheduled Time'] || '99').localeCompare(b['Scheduled Time'] || '99');
+}
+
+/* the dark band at the top: greeting, one-line summary, quick actions */
+function heroBand(summary, actions) {
+  var d = new Date();
+  var day = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d.getDay()];
+  return '<section class="hero">' +
+    '<div class="hero-main">' +
+      '<p class="hero-eyebrow"><span class="live-dot" aria-hidden="true"></span>Live · ' + day + ', ' + fmtDate(todayStr()) +
+      ' · updated ' + nowClock() + '</p>' +
+      '<h2>' + esc(greeting()) + '</h2>' +
+      '<p class="hero-sum">' + summary + '</p>' +
+    '</div>' +
+    '<div class="hero-actions">' + actions + '</div>' +
+  '</section>';
+}
+function eodActionBtn(submitted) {
+  if (submitted === true) return '<button class="btn hero-btn" onclick="navigate(\'eod\')">' + icon('check', 16) + 'EOD submitted</button>';
+  return '<button class="btn hero-btn" onclick="navigate(\'eod\')">' + icon('note', 16) + (submitted === false ? 'Submit my EOD' : 'My EOD log') + '</button>';
+}
+function isAfterFive() { return new Date().getHours() >= 17; }
+
+/* ============================================================
  * VIEW — ADMIN DASHBOARD
- * Today strip · clickable KPIs · overdue list · team workload · 7-day trend
+ * Summary band · today rings · clickable KPIs · priority mix · overdue · team · coming up · 7-day trend
  * ============================================================ */
 async function renderAdminDashboard(c) {
   var results = await Promise.all([
@@ -433,11 +743,26 @@ async function renderAdminDashboard(c) {
   var todayDone = todays.filter(function(x) { return x['Status'] === 'Completed'; }).length;
   var completed = count('Completed');
   var urgent = overdue.filter(function(x) { return x['Priority'] === 'High' || x['Priority'] === 'Critical'; }).length;
+  var comingUp = todays.filter(function(x) { return isPendingStatus(x['Status']); }).sort(byTimeToday);
 
   /* --- EOD today --- */
   var eodTotal = k.eodSubmitted + k.eodPending.length;
   var waiting = k.eodPending.slice(0, 8).map(esc).join(', ') +
     (k.eodPending.length > 8 ? ' +' + (k.eodPending.length - 8) + ' more' : '');
+
+  /* --- one-line summary --- */
+  var bits = [];
+  bits.push(overdue.length ? '<strong>' + plural(overdue.length, 'ticket is', 'tickets are') + ' overdue</strong>' +
+    (urgent ? ' (' + urgent + ' high or critical)' : '') : 'Nothing is overdue');
+  bits.push(todays.length ? todayDone + ' of ' + todays.length + ' scheduled today ' + (todayDone === 1 && todays.length === 1 ? 'is' : 'are') + ' done' : 'nothing is scheduled today');
+  if (isAfterFive() && k.eodPending.length) bits.push(plural(k.eodPending.length, 'EOD log is', 'EOD logs are') + ' still pending');
+  var summary = bits.join(' · ') + '.';
+
+  /* --- active work by priority --- */
+  var active = live.filter(function(x) { return isPendingStatus(x['Status']) || x['Status'] === 'Overdue'; });
+  var prios = [['Critical', 'late'], ['High', 'progress'], ['Medium', 'open'], ['Low', 'hold']].map(function(p) {
+    return { name: p[0], tone: p[1], n: active.filter(function(x) { return x['Priority'] === p[0]; }).length };
+  });
 
   /* --- team workload, per person --- */
   var team = {};
@@ -448,9 +773,9 @@ async function renderAdminDashboard(c) {
   });
   live.forEach(function(x) {
     var id = x['Assigned To'];
-    var active = isPendingStatus(x['Status']) || x['Status'] === 'Overdue';
+    var isActive = isPendingStatus(x['Status']) || x['Status'] === 'Overdue';
     if (!team[id]) {
-      if (!active && x['Scheduled Date'] !== t) return;      // nothing current for this person
+      if (!isActive && x['Scheduled Date'] !== t) return;      // nothing current for this person
       team[id] = { id: id, name: userName(id), isEmp: false, today: 0, todayDone: 0, pending: 0, overdue: 0 };
     }
     var m = team[id];
@@ -463,29 +788,43 @@ async function renderAdminDashboard(c) {
   });
 
   c.innerHTML =
+    heroBand(summary,
+      '<button class="btn btn-primary" onclick="navigate(\'createTicket\')">' + icon('plus', 16) + 'New ticket</button>' +
+      eodActionBtn(k.eodSubmittedToday)) +
+
     /* today strip */
     '<div class="two-col">' +
       '<div class="panel"><div class="panel-head"><h3>Today\'s tickets</h3>' +
-        '<span class="muted small">' + fmtDate(t) + ' · updated ' + nowClock() + '</span></div>' +
-        '<div class="progress-num">' + todayDone + ' <small>of ' + todays.length + ' done</small></div>' +
-        progressBar(todayDone, todays.length) +
-        '<p class="muted small">' + (todays.length ? (todays.length - todayDone) + ' still to finish today.' : 'Nothing is scheduled for today.') + '</p></div>' +
+        '<button class="btn btn-ghost btn-sm" onclick="goTickets(\'date\',\'' + t + '\')">View today</button></div>' +
+        '<div class="ring-row">' + progressRing(todayDone, todays.length) + '<div>' +
+        '<div class="progress-num"><span data-count="' + todayDone + '">' + todayDone + '</span> <small>of ' + todays.length + ' done</small></div>' +
+        '<p class="muted small">' + (todays.length ? (todays.length - todayDone) + ' still to finish today.' : 'Nothing is scheduled for today.') + '</p></div></div></div>' +
 
       '<div class="panel"><div class="panel-head"><h3>EOD logs today</h3>' +
         '<button class="btn btn-ghost btn-sm" onclick="navigate(\'eodAdmin\')">View logs</button></div>' +
-        '<div class="progress-num">' + k.eodSubmitted + ' <small>of ' + eodTotal + ' submitted</small></div>' +
-        progressBar(k.eodSubmitted, eodTotal) +
-        '<p class="muted small">' + (k.eodPending.length ? 'Waiting on: ' + waiting : 'Everyone has submitted.') + '</p></div>' +
+        '<div class="ring-row">' + progressRing(k.eodSubmitted, eodTotal) + '<div>' +
+        '<div class="progress-num"><span data-count="' + k.eodSubmitted + '">' + k.eodSubmitted + '</span> <small>of ' + eodTotal + ' submitted</small></div>' +
+        '<p class="muted small">' + (k.eodPending.length ? 'Waiting on: ' + waiting : 'Everyone has submitted.') + '</p></div></div></div>' +
     '</div>' +
 
     /* KPIs — click any card to open that list */
     '<div class="kpi-grid kpi-fit">' +
-      kpiCard('Overdue', overdue.length, 'k-late k-accent', urgent ? urgent + ' high or critical' : '', 'status', 'Overdue') +
-      kpiCard('Open', count('Open'), 'k-open', 'Not started', 'status', 'Open') +
-      kpiCard('In progress', count('In Progress'), 'k-progress', '', 'status', 'In Progress') +
-      kpiCard('On hold', count('On Hold'), '', '', 'status', 'On Hold') +
-      kpiCard('Completion rate', pctOf(completed, live.length) + '%', 'k-done', completed + ' of ' + live.length + ' tickets', 'status', 'Completed') +
+      kpiCard('Overdue', overdue.length, 'k-late k-accent', urgent ? urgent + ' high or critical' : '', 'status', 'Overdue', 'alert') +
+      kpiCard('Open', count('Open'), 'k-open', 'Not started', 'status', 'Open', 'dot') +
+      kpiCard('In progress', count('In Progress'), 'k-progress', '', 'status', 'In Progress', 'activity') +
+      kpiCard('On hold', count('On Hold'), 'k-hold', '', 'status', 'On Hold', 'pause') +
+      kpiCard('Completion rate', pctOf(completed, live.length) + '%', 'k-done', completed + ' of ' + live.length + ' tickets', 'status', 'Completed', 'target') +
     '</div>' +
+
+    /* priority mix of everything still active */
+    (active.length ?
+      '<div class="panel prio-panel"><div class="prio-head"><h3>Active work by priority</h3><span class="muted small">' + plural(active.length, 'ticket', 'tickets') + ' not finished yet</span></div>' +
+      '<div class="prio-bar" role="img" aria-label="Priority mix">' + prios.map(function(p) {
+        return p.n ? '<span class="tone-' + p.tone + '" style="flex:' + p.n + '" title="' + p.name + ': ' + p.n + '"></span>' : '';
+      }).join('') + '</div>' +
+      '<div class="prio-legend">' + prios.map(function(p) {
+        return '<span><i class="tone-' + p.tone + '"></i>' + p.name + ' <strong>' + p.n + '</strong></span>';
+      }).join('') + '</div></div>' : '') +
 
     '<div class="dash-split">' +
       /* overdue list */
@@ -495,11 +834,11 @@ async function renderAdminDashboard(c) {
         (overdue.length ?
           '<div class="table-wrap scroll-y"><table class="compact"><tbody>' + overdue.slice(0, 8).map(function(x) {
             return '<tr class="clickable" onclick="openTicket(\'' + esc(x['Ticket ID']) + '\')">' +
-              '<td><div class="t-title">' + esc(x['Title']) + '</div><div class="t-sub">' + esc(x['Ticket ID']) + ' · ' + esc(userName(x['Assigned To'])) + '</div></td>' +
+              '<td><div class="t-title">' + esc(x['Title']) + '</div><div class="t-sub"><span class="mono">' + esc(x['Ticket ID']) + '</span> · ' + esc(userName(x['Assigned To'])) + '</div></td>' +
               '<td>' + priorityBadge(x['Priority']) + '</td>' +
               '<td class="small num-late" style="white-space:nowrap">' + lateLabel(x) + '</td></tr>';
           }).join('') + '</tbody></table></div>' :
-          '<div class="empty-state" style="padding:28px 20px"><p>No overdue tickets right now.</p></div>') +
+          '<div class="empty-state" style="padding:28px 20px"><div class="e-ico e-ok">' + icon('check', 24) + '</div><p>No overdue tickets right now.</p></div>') +
       '</div>' +
 
       /* team workload */
@@ -511,25 +850,42 @@ async function renderAdminDashboard(c) {
               (k.eodPending.indexOf(m.name) === -1 ? '<span class="badge b-done">Submitted</span>' : '<span class="badge b-progress">Pending</span>');
             return '<tr class="clickable" onclick="goTickets(\'employee\',\'' + esc(m.id) + '\')">' +
               '<td class="t-title">' + esc(m.name) + '</td>' +
-              '<td class="small">' + (m.today ? m.todayDone + '/' + m.today + progressBar(m.todayDone, m.today, true) : '<span class="muted">—</span>') + '</td>' +
-              '<td>' + (m.pending || '<span class="num-zero">0</span>') + '</td>' +
-              '<td>' + (m.overdue ? '<span class="num-late">' + m.overdue + '</span>' : '<span class="num-zero">0</span>') + '</td>' +
+              '<td class="small mono">' + (m.today ? m.todayDone + '/' + m.today + progressBar(m.todayDone, m.today, true) : '<span class="muted">—</span>') + '</td>' +
+              '<td class="mono">' + (m.pending || '<span class="num-zero">0</span>') + '</td>' +
+              '<td class="mono">' + (m.overdue ? '<span class="num-late">' + m.overdue + '</span>' : '<span class="num-zero">0</span>') + '</td>' +
               '<td>' + eod + '</td></tr>';
           }).join('') + '</tbody></table></div>' :
-          '<div class="empty-state" style="padding:28px 20px"><p>Add team members under Employees to see their workload here.</p></div>') +
+          '<div class="empty-state" style="padding:28px 20px"><div class="e-ico">' + icon('users', 24) + '</div><p>Add team members under Employees to see their workload here.</p></div>') +
       '</div>' +
     '</div>' +
 
-    '<div class="panel"><div class="panel-head"><h3>Last 7 days</h3><span class="muted small">How much of each day\'s scheduled work got done</span></div>' +
-      '<div class="chart-box" style="height:220px"><canvas id="chWeek"></canvas></div></div>';
+    '<div class="dash-split dash-split-rev">' +
+      /* coming up today */
+      '<div class="panel"><div class="panel-head"><h3>Coming up today</h3>' +
+        (comingUp.length > 6 ? '<button class="btn btn-ghost btn-sm" onclick="goTickets(\'date\',\'' + t + '\')">View all ' + comingUp.length + '</button>' :
+          '<span class="muted small">By scheduled time</span>') + '</div>' +
+        (comingUp.length ?
+          '<div class="upnext-list">' + comingUp.slice(0, 6).map(function(x) {
+            return '<button class="upnext" onclick="openTicket(\'' + esc(x['Ticket ID']) + '\')">' +
+              '<span class="upnext-time mono">' + (x['Scheduled Time'] ? fmtTime(x['Scheduled Time']) : '—') + '</span>' +
+              '<span class="upnext-body"><span class="t-title">' + esc(x['Title']) + '</span><span class="t-sub">' + esc(userName(x['Assigned To'])) + '</span></span>' +
+              whenLabel(x) + '</button>';
+          }).join('') + '</div>' :
+          '<div class="empty-state" style="padding:28px 20px"><div class="e-ico e-ok">' + icon('check', 24) + '</div><p>' +
+            (todays.length ? 'Everything scheduled for today is done.' : 'Nothing is scheduled for today.') + '</p></div>') +
+      '</div>' +
+
+      '<div class="panel"><div class="panel-head"><h3>Last 7 days</h3><span class="muted small">How much of each day\'s scheduled work got done</span></div>' +
+        '<div class="chart-box" style="height:250px"><canvas id="chWeek"></canvas></div></div>' +
+    '</div>';
 
   makeChart('chWeek', {
     type: 'bar',
     data: {
       labels: k.weekSeries.map(function(d) { return d.date; }),
       datasets: [
-        { label: 'Completed', data: k.weekSeries.map(function(d) { return d.completed; }), backgroundColor: '#187A3C', maxBarThickness: 44 },
-        { label: 'Not completed', data: k.weekSeries.map(function(d) { return d.total - d.completed; }), backgroundColor: '#D5DAE1', maxBarThickness: 44 }
+        { label: 'Completed', data: k.weekSeries.map(function(d) { return d.completed; }), backgroundColor: cssVar('--done'), maxBarThickness: 40, borderRadius: 4 },
+        { label: 'Not completed', data: k.weekSeries.map(function(d) { return d.total - d.completed; }), backgroundColor: cssVar('--bar-rest'), maxBarThickness: 40, borderRadius: 4 }
       ]
     },
     options: {
@@ -541,7 +897,7 @@ async function renderAdminDashboard(c) {
 
 /* ============================================================
  * VIEW — EMPLOYEE DASHBOARD
- * Today strip · clickable KPIs · carried-over work · today's tasks
+ * Summary band · today ring + next up · clickable KPIs · carried-over work · today's tasks
  * ============================================================ */
 async function renderEmployeeDashboard(c) {
   var results = await Promise.all([api('employeeKPIs'), api('listTickets')]);
@@ -556,6 +912,7 @@ async function renderEmployeeDashboard(c) {
   var todays = mine.filter(function(x) { return x['Scheduled Date'] === t; });
   todays.sort(function(a, b) { return (a['Scheduled Time'] || '99').localeCompare(b['Scheduled Time'] || '99'); });
   var todayDone = todays.filter(function(x) { return x['Status'] === 'Completed'; }).length;
+  var left = todays.length - todayDone;
 
   /* unfinished work from earlier days — overdue first, then oldest */
   var carried = mine.filter(function(x) {
@@ -564,29 +921,51 @@ async function renderEmployeeDashboard(c) {
     return ((b['Status'] === 'Overdue') - (a['Status'] === 'Overdue')) || oldestFirst(a, b);
   });
 
+  /* what to do next: whatever is in progress, else the earliest unfinished task today, else the oldest carried-over one */
+  var queue = todays.filter(function(x) { return x['Status'] !== 'Completed'; }).sort(byTimeToday);
+  var next = queue[0] || carried[0] || null;
+  var nextIsToday = !!queue[0];
+
   var cutoff = fmtTime(state.settings.EOD_CUTOFF || '23:00');
+  var bits = [];
+  bits.push(todays.length ? (left ? '<strong>' + plural(left, 'task', 'tasks') + ' left today</strong>' : '<strong>All of today\'s tasks are done</strong>') : 'Nothing is scheduled for you today');
+  if (carried.length) bits.push(plural(carried.length, 'task', 'tasks') + ' carried over from earlier days');
+  if (!k.eodSubmittedToday && isAfterFive()) bits.push('your EOD log is due by ' + cutoff);
+  var summary = bits.join(' · ') + '.';
 
   c.innerHTML =
+    heroBand(summary,
+      '<button class="btn btn-primary" onclick="navigate(\'createTicket\')">' + icon('plus', 16) + 'New ticket</button>' +
+      eodActionBtn(!!k.eodSubmittedToday)) +
+
     '<div class="two-col">' +
       '<div class="panel"><div class="panel-head"><h3>Today\'s tasks</h3>' +
-        '<span class="muted small">' + fmtDate(t) + ' · updated ' + nowClock() + '</span></div>' +
-        '<div class="progress-num">' + todayDone + ' <small>of ' + todays.length + ' done</small></div>' +
-        progressBar(todayDone, todays.length) +
-        '<p class="muted small">' + (todays.length ? (todays.length === todayDone ? 'All of today\'s tasks are done.' : (todays.length - todayDone) + ' still to finish today.') : 'Nothing is scheduled for you today.') + '</p></div>' +
+        '<button class="btn btn-ghost btn-sm" onclick="navigate(\'today\')">View today</button></div>' +
+        '<div class="ring-row">' + progressRing(todayDone, todays.length) + '<div>' +
+        '<div class="progress-num"><span data-count="' + todayDone + '">' + todayDone + '</span> <small>of ' + todays.length + ' done</small></div>' +
+        '<p class="muted small">' + (todays.length ? (left ? left + ' still to finish today.' : 'All of today\'s tasks are done.') : 'Nothing is scheduled for you today.') + '</p></div></div></div>' +
 
-      '<div class="panel" style="border-left:3px solid var(--' + (k.eodSubmittedToday ? 'done' : 'progress') + ')">' +
-        '<div class="panel-head"><h3>EOD work log</h3>' +
-        '<button class="btn ' + (k.eodSubmittedToday ? 'btn-ghost' : 'btn-primary') + ' btn-sm" onclick="navigate(\'eod\')">' +
-          (k.eodSubmittedToday ? 'View or edit log' : 'Submit EOD log') + '</button></div>' +
-        '<div class="progress-num" style="font-size:1.25rem">' + (k.eodSubmittedToday ? 'Submitted for today' : 'Not submitted yet') + '</div>' +
-        '<p class="muted small" style="margin-top:8px">' + (k.eodSubmittedToday ? 'You can edit it until ' + cutoff + '.' : 'Submit your end-of-day work log before ' + cutoff + '.') + '</p></div>' +
+      '<div class="panel next-up">' +
+        (next ?
+          '<div class="panel-head"><h3>Next up</h3>' + (nextIsToday ? whenLabel(next) : '<span class="when when-past">' + lateLabel(next) + '</span>') + '</div>' +
+          '<button class="next-title" onclick="openTicket(\'' + esc(next['Ticket ID']) + '\')">' + esc(next['Title']) + '</button>' +
+          '<p class="t-sub"><span class="mono">' + esc(next['Ticket ID']) + '</span> · ' +
+            fmtDate(next['Scheduled Date']) + (next['Scheduled Time'] ? ' · ' + fmtTime(next['Scheduled Time']) : '') + '</p>' +
+          '<div class="next-actions">' + priorityBadge(next['Priority']) + statusBadge(next['Status']) +
+            '<span class="next-btn">' + quickActionBtn(next) + '</span></div>'
+          :
+          '<div class="panel-head"><h3>Next up</h3></div>' +
+          '<div class="ring-row"><span class="chip chip-xl chip-done">' + icon('check', 30) + '</span><div>' +
+          '<div class="progress-num" style="font-size:1.2rem">You\'re clear</div>' +
+          '<p class="muted small">Working on something that isn\'t listed? Add it as a ticket so it counts.</p></div></div>') +
+      '</div>' +
     '</div>' +
 
     '<div class="kpi-grid kpi-fit">' +
-      kpiCard('Overdue', count('Overdue'), 'k-late k-accent', '', 'status', 'Overdue') +
-      kpiCard('Open', count('Open'), 'k-open', 'Not started', 'status', 'Open') +
-      kpiCard('In progress', count('In Progress'), 'k-progress', '', 'status', 'In Progress') +
-      kpiCard('Completed', count('Completed'), 'k-done', 'of ' + mine.length + ' assigned', 'status', 'Completed') +
+      kpiCard('Overdue', count('Overdue'), 'k-late k-accent', '', 'status', 'Overdue', 'alert') +
+      kpiCard('Open', count('Open'), 'k-open', 'Not started', 'status', 'Open', 'dot') +
+      kpiCard('In progress', count('In Progress'), 'k-progress', '', 'status', 'In Progress', 'activity') +
+      kpiCard('Completed', count('Completed'), 'k-done', 'of ' + mine.length + ' assigned', 'status', 'Completed', 'check') +
     '</div>' +
 
     (carried.length ?
@@ -635,6 +1014,7 @@ async function renderTickets(c, opts) {
   // filters passed in from a dashboard card or team row
   var o = opts || {};
   presetSelect('fStatus', o.status);
+  presetSelect('fPriority', o.priority);
   presetSelect('fEmployee', o.employee, o.employee ? userName(o.employee) : '');
   if (o.date) document.getElementById('fDate').value = o.date;
   applyFilters();
@@ -683,7 +1063,7 @@ function applyFilters() {
 
 function ticketsTable(list, quickActions) {
   if (!list.length) {
-    return '<div class="empty-state"><div class="e-ico">🗂</div><p>No tickets here yet.</p></div>';
+    return '<div class="empty-state"><div class="e-ico">' + icon('folder', 24) + '</div><p>No tickets here yet.</p></div>';
   }
   var isAdmin = state.user.role === 'Admin';
   return '<div class="table-wrap"><table><thead><tr>' +
@@ -693,8 +1073,8 @@ function ticketsTable(list, quickActions) {
     list.map(function(x) {
       var sched = fmtDate(x['Scheduled Date']) + (x['Scheduled Time'] ? ' · ' + fmtTime(x['Scheduled Time']) : '');
       return '<tr class="clickable" onclick="openTicket(\'' + x['Ticket ID'] + '\')">' +
-        '<td><div class="t-title">' + esc(x['Title']) + '</div><div class="t-sub">' + esc(x['Ticket ID']) +
-          ' · ' + esc(x['Ticket Type']) + '</div></td>' +
+        '<td><div class="t-title">' + esc(x['Title']) + '</div><div class="t-sub"><span class="mono">' + esc(x['Ticket ID']) +
+          '</span> · ' + esc(x['Ticket Type']) + (x['Created By'] && x['Created By'] === x['Assigned To'] ? ' · <span class="tag-self">Self-created</span>' : '') + '</div></td>' +
         (isAdmin ? '<td>' + esc(userName(x['Assigned To'])) + '</td>' : '') +
         '<td>' + priorityBadge(x['Priority']) + '</td>' +
         '<td class="small">' + sched + '</td>' +
@@ -752,8 +1132,9 @@ function renderTicketModal(t, activity) {
 
   openModal(
     '<div class="modal-head"><div><h3>' + esc(t['Title']) + '</h3>' +
-    '<p class="muted small">' + esc(t['Ticket ID']) +
-    (t['Parent Ticket ID'] ? ' · from ' + esc(t['Parent Ticket ID']) : '') + '</p></div>' +
+    '<p class="muted small"><span class="mono">' + esc(t['Ticket ID']) + '</span>' +
+    (t['Parent Ticket ID'] ? ' · from <span class="mono">' + esc(t['Parent Ticket ID']) + '</span>' : '') +
+    (t['Created By'] && t['Created By'] === t['Assigned To'] ? ' · <span class="tag-self">Self-created</span>' : '') + '</p></div>' +
     '<button class="icon-btn" onclick="closeModal()" aria-label="Close">&times;</button></div>' +
 
     statusBadge(t['Status']) + ' ' + priorityBadge(t['Priority']) +
@@ -776,7 +1157,8 @@ function renderTicketModal(t, activity) {
       '<label class="field">Update status<select id="tStatus">' + optionsHtml(statuses, t['Status']) + '</select></label>' +
       '<label class="field span-2">Add a comment / update<textarea id="tComment" placeholder="e.g., Report prepared and shared with the concerned team."></textarea></label>' +
       '</div><div class="modal-actions">' +
-      (isAdmin ? '<button class="btn btn-danger" onclick="cancelTicketUI(\'' + t['Ticket ID'] + '\')">Cancel ticket</button>' : '') +
+      (isAdmin || (t['Created By'] === state.user.id && t['Assigned To'] === state.user.id && t['Status'] !== 'Completed') ?
+        '<button class="btn btn-danger" onclick="cancelTicketUI(\'' + t['Ticket ID'] + '\')">Cancel ticket</button>' : '') +
       (isAdmin ? '<button class="btn btn-ghost" onclick="editTicketUI(\'' + t['Ticket ID'] + '\')">Edit details</button>' : '') +
       '<button class="btn btn-primary" onclick="saveTicketUpdate(\'' + t['Ticket ID'] + '\',\'' + esc(t['Status']) + '\')">Save update</button>' +
       '</div></div>' : '') +
@@ -828,6 +1210,10 @@ function editTicketUI(id) {
  * VIEW — CREATE TICKET (Admin)
  * ============================================================ */
 function renderCreateTicket(c) {
+  if (state.user.role !== 'Admin') {          // employees don't need (and can't load) the user list
+    c.innerHTML = '<div class="panel" style="max-width:760px">' + ticketFormHtml(null) + '</div>';
+    return;
+  }
   loadUsersThen(function() {
     c.innerHTML = '<div class="panel" style="max-width:760px">' + ticketFormHtml(null) + '</div>';
   }, c);
@@ -846,12 +1232,16 @@ function ticketFormHtml(t) {
   var depts = settingList('DEPARTMENTS', 'Operations');
   return (edit ? '<div class="modal-head"><h3>Edit ' + esc(t['Ticket ID']) + '</h3>' +
       '<button class="icon-btn" onclick="closeModal()" aria-label="Close">&times;</button></div>'
-    : '<div class="panel-head"><h3>Create a ticket</h3><p class="muted small">One-time tasks. For repeating tasks, use Recurring Tickets.</p></div>') +
+    : (state.user.role === 'Admin' ?
+        '<div class="panel-head"><h3>Create a ticket</h3><p class="muted small">One-time tasks. For repeating tasks, use Recurring Tickets.</p></div>' :
+        '<div class="panel-head"><h3>Create a ticket for yourself</h3><p class="muted small">For work you picked up that nobody assigned. It is assigned to you and your manager can see it.</p></div>')) +
     '<div class="form-grid">' +
     '<label class="field span-2">Title<input id="cTitle" value="' + esc(t['Title'] || '') + '" placeholder="e.g., Prepare monthly electricity report"></label>' +
     '<label class="field span-2">Description<textarea id="cDesc" placeholder="What needs to be done, and any context.">' + esc(t['Description'] || '') + '</textarea></label>' +
-    '<label class="field">Assign to<select id="cAssign">' + userOptions(t['Assigned To']) + '</select></label>' +
-    '<label class="field">Department<select id="cDept">' + optionsHtml(depts, t['Department']) + '</select></label>' +
+    (state.user.role === 'Admin' ?
+      '<label class="field">Assign to<select id="cAssign">' + userOptions(t['Assigned To']) + '</select></label>' :
+      '<label class="field">Assigned to<input value="' + esc(state.user.name) + ' (you)" readonly></label>') +
+    '<label class="field">Department<select id="cDept">' + optionsHtml(depts, t['Department'] || (edit ? '' : state.user.department)) + '</select></label>' +
     '<label class="field">Priority<select id="cPriority">' + optionsHtml(priorities, t['Priority'] || 'Medium') + '</select></label>' +
     '<label class="field">Scheduled date<input type="date" id="cSchedDate" value="' + esc(t['Scheduled Date'] || todayStr()) + '"></label>' +
     '<label class="field">Scheduled time<input type="time" id="cSchedTime" value="' + esc(t['Scheduled Time'] || '') + '"></label>' +
@@ -868,7 +1258,7 @@ async function saveTicketForm(editId) {
   var p = {
     title: document.getElementById('cTitle').value.trim(),
     description: document.getElementById('cDesc').value.trim(),
-    assignedTo: document.getElementById('cAssign').value,
+    assignedTo: (document.getElementById('cAssign') || {}).value || state.user.id,
     department: document.getElementById('cDept').value,
     priority: document.getElementById('cPriority').value,
     scheduledDate: document.getElementById('cSchedDate').value,
@@ -877,7 +1267,8 @@ async function saveTicketForm(editId) {
   };
   if (!p.title) { toast('Add a title for the ticket.', 'error'); return; }
   if (!p.scheduledDate) { toast('Pick a scheduled date.', 'error'); return; }
-  btn.disabled = true;
+  if (p.dueDate && p.dueDate < p.scheduledDate) { toast('The due date cannot be before the scheduled date.', 'error'); return; }
+  setBusy(btn, true);
   try {
     if (editId) {
       p.id = editId;
@@ -886,11 +1277,11 @@ async function saveTicketForm(editId) {
       closeModal(); renderView();
     } else {
       var out = await api('createTicket', p);
-      toast('Ticket ' + out.id + ' created and assigned.', 'success');
+      toast(state.user.role === 'Admin' ? 'Ticket ' + out.id + ' created and assigned.' : 'Ticket ' + out.id + ' added to your list.', 'success');
       navigate('tickets');
     }
-  } catch (e) { toast(e.message, 'error'); }
-  finally { btn.disabled = false; }
+  } catch (e) { toast(e.code === 'FORBIDDEN' ? 'Creating your own tickets is not switched on yet. Ask your admin to deploy the latest Code.gs.' : e.message, 'error'); }
+  finally { setBusy(btn, false); }
 }
 
 /* ============================================================
@@ -919,7 +1310,7 @@ async function renderRecurring(c) {
           '<td><span class="badge ' + (active ? 'b-done' : 'b-hold') + '">' + esc(r['Status']) + '</span></td>' +
           '<td><button class="btn btn-ghost btn-sm" onclick="toggleRecurring(\'' + r['Recurring ID'] + '\',\'' + (active ? 'Paused' : 'Active') + '\')">' + (active ? 'Pause' : 'Resume') + '</button></td></tr>';
       }).join('') + '</tbody></table></div>'
-      : '<div class="empty-state"><div class="e-ico">↻</div><p>No recurring templates yet. Create one to auto-generate daily, weekly or monthly tickets.</p></div>') +
+      : '<div class="empty-state"><div class="e-ico">' + icon('repeat', 24) + '</div><p>No recurring templates yet. Create one to auto-generate daily, weekly or monthly tickets.</p></div>') +
     '</div>';
 }
 
@@ -1059,8 +1450,14 @@ async function toggleUser(id, status) {
  * VIEW — EOD (Employee)
  * ============================================================ */
 async function renderEmployeeEOD(c) {
-  var logs = await api('myEOD');
+  var both = await Promise.all([api('myEOD'), api('listTickets')]);
+  var logs = both[0];
   var t = todayStr();
+  // my own tickets for today (an admin's list holds everyone's, so filter to me)
+  state._eodToday = both[1].filter(function(x) {
+    return x['Assigned To'] === state.user.id && x['Scheduled Date'] === t && x['Status'] !== 'Cancelled';
+  });
+  var doneToday = state._eodToday.filter(function(x) { return x['Status'] === 'Completed'; }).length;
   var todayLog = logs.filter(function(l) { return l['Date'] === t; })[0] || {};
   var cutoff = state.settings.EOD_CUTOFF || '23:00';
 
@@ -1068,7 +1465,10 @@ async function renderEmployeeEOD(c) {
     '<div class="panel eod-card"><div class="panel-head"><h3>Today\'s EOD work log — ' + fmtDate(t) + '</h3>' +
     (todayLog['Log ID'] ? '<span class="badge b-done">Submitted ' + esc(String(todayLog['Submitted At']).slice(11, 16)) + '</span>' : '<span class="badge b-progress">Not submitted</span>') +
     '</div>' +
-    '<p class="muted small" style="margin-bottom:14px">Ticket counts are filled automatically from today\'s tickets. You can edit this log until ' + fmtTime(cutoff) + '.</p>' +
+    '<p class="muted small" style="margin-bottom:12px">Ticket counts are filled automatically from today\'s tickets. You can edit this log until ' + fmtTime(cutoff) + '.</p>' +
+    '<div class="eod-today"><span class="mono"><strong>' + state._eodToday.length + '</strong> assigned</span><span class="mono"><strong>' + doneToday + '</strong> completed</span>' +
+    '<span class="mono"><strong>' + (state._eodToday.length - doneToday) + '</strong> pending</span>' +
+    (state._eodToday.length ? '<button class="btn btn-ghost btn-sm" onclick="fillEODFromTickets()">' + icon('wand', 15) + 'Fill from today\'s tickets</button>' : '') + '</div>' +
     '<div class="form-grid">' +
     '<label class="field span-2">Work completed today<textarea id="eWork" placeholder="e.g., Electricity complaints report; housekeeping dashboard update">' + esc(todayLog['Work Completed'] || '') + '</textarea></label>' +
     '<label class="field">Challenges / blockers<textarea id="eChallenges" placeholder="e.g., Waiting for data from operations team">' + esc(todayLog['Challenges'] || '') + '</textarea></label>' +
@@ -1081,8 +1481,23 @@ async function renderEmployeeEOD(c) {
 
     '<div class="panel"><div class="panel-head"><h3>Previous logs</h3></div>' +
     (logs.length ? logs.map(eodCard).join('') :
-      '<div class="empty-state"><div class="e-ico">📝</div><p>No EOD logs yet. Your first one will appear here.</p></div>') +
+      '<div class="empty-state"><div class="e-ico">' + icon('note', 24) + '</div><p>No EOD logs yet. Your first one will appear here.</p></div>') +
     '</div>';
+}
+
+/* drop today's ticket titles into the form so nobody retypes them; never overwrites what is already written */
+function fillEODFromTickets() {
+  var list = state._eodToday || [];
+  var line = function(x) { return '• ' + x['Title'] + ' (' + x['Ticket ID'] + ')'; };
+  var done = list.filter(function(x) { return x['Status'] === 'Completed'; }).map(line).join('\n');
+  var open = list.filter(function(x) { return x['Status'] !== 'Completed'; }).map(line).join('\n');
+  var add = function(id, text) {
+    var el = document.getElementById(id);
+    if (!text || el.value.indexOf(text) !== -1) return;
+    el.value = (el.value.trim() ? el.value.trim() + '\n' : '') + text;
+  };
+  add('eWork', done); add('ePending', open);
+  toast(done || open ? 'Added today\'s tickets. Edit the text as you like.' : 'No tickets to add.', 'success');
 }
 
 function eodCard(l) {
@@ -1153,7 +1568,7 @@ function filterAdminEOD() {
   });
   var box = document.getElementById('eodListBox');
   if (!list.length) {
-    box.innerHTML = '<div class="panel"><div class="empty-state"><div class="e-ico">📝</div><p>No EOD logs match these filters.</p></div></div>';
+    box.innerHTML = '<div class="panel"><div class="empty-state"><div class="e-ico">' + icon('note', 24) + '</div><p>No EOD logs match these filters.</p></div></div>';
     return;
   }
   // who hasn't submitted for the selected date
@@ -1303,4 +1718,10 @@ async function saveSettings() {
 document.getElementById('loginCode').addEventListener('keydown', function(e) {
   if (e.key === 'Enter') doLogin();
 });
+['resetEmail', 'resetOtp', 'resetNewCode'].forEach(function(id) {
+  document.getElementById(id).addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') doReset();
+  });
+});
+applyTheme(currentTheme());
 if (state.token && state.user) enterApp();
