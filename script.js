@@ -58,6 +58,8 @@ async function doLogin() {
     localStorage.setItem('od_token', data.token);
     localStorage.setItem('od_user', JSON.stringify(data.user));
     localStorage.setItem('od_settings', JSON.stringify(data.settings));
+    document.getElementById('loginCode').value = '';
+    setPasswordVisible(false);
     enterApp();
   } catch (e) {
     err.textContent = e.message;
@@ -69,17 +71,51 @@ async function doLogin() {
 function logout(expired) {
   ['od_token', 'od_user', 'od_settings'].forEach(function(k) { localStorage.removeItem(k); });
   state.token = null; state.user = null;
+  closeProfile();
   document.getElementById('app').classList.add('hidden');
   document.getElementById('loginScreen').classList.remove('hidden');
   if (expired) toast('Your session expired. Please sign in again.', 'error');
 }
 
+/* show / hide the access code on the login screen */
+function setPasswordVisible(show) {
+  var input = document.getElementById('loginCode');
+  var btn = document.getElementById('pwToggle');
+  input.type = show ? 'text' : 'password';
+  btn.classList.toggle('on', show);
+  btn.setAttribute('aria-pressed', show ? 'true' : 'false');
+  btn.setAttribute('aria-label', show ? 'Hide access code' : 'Show access code');
+  btn.title = show ? 'Hide access code' : 'Show access code';
+}
+function togglePassword() {
+  setPasswordVisible(document.getElementById('loginCode').type === 'password');
+  document.getElementById('loginCode').focus();
+}
+
+/* profile menu (top right) */
+function toggleProfile() {
+  var panel = document.getElementById('profilePanel');
+  var opening = panel.classList.contains('hidden');
+  panel.classList.toggle('hidden', !opening);
+  document.getElementById('profileBtn').setAttribute('aria-expanded', opening ? 'true' : 'false');
+  if (opening) document.getElementById('notifPanel').classList.add('hidden');
+}
+function closeProfile() {
+  document.getElementById('profilePanel').classList.add('hidden');
+  document.getElementById('profileBtn').setAttribute('aria-expanded', 'false');
+}
+
 async function enterApp() {
   document.getElementById('loginScreen').classList.add('hidden');
   document.getElementById('app').classList.remove('hidden');
+  // profile menu (top right)
   document.getElementById('userName').textContent = state.user.name;
-  document.getElementById('userRole').textContent = state.user.role + (state.user.department ? ' · ' + state.user.department : '');
+  document.getElementById('userFirstName').textContent = String(state.user.name || '').split(/\s+/)[0];
+  document.getElementById('userEmail').textContent = state.user.email || '';
+  document.getElementById('userRole').textContent = state.user.role;
+  document.getElementById('userDept').textContent = state.user.department || '—';
   document.getElementById('userAvatar').textContent = initials(state.user.name);
+  document.getElementById('userAvatarLg').textContent = initials(state.user.name);
   buildSidebar();
   navigate('dashboard');
   try {
@@ -312,6 +348,7 @@ function toggleNotifs() {
   var opening = panel.classList.contains('hidden');
   panel.classList.toggle('hidden');
   if (!opening) return;
+  closeProfile();
   if (!state.notifs.length) {
     panel.innerHTML = '<div class="notif-empty">You\'re all caught up.</div>';
   } else {
@@ -325,6 +362,12 @@ function toggleNotifs() {
 }
 document.addEventListener('click', function(e) {
   if (!e.target.closest('.notif-wrap')) document.getElementById('notifPanel').classList.add('hidden');
+  if (!e.target.closest('.profile-wrap')) closeProfile();
+});
+document.addEventListener('keydown', function(e) {
+  if (e.key !== 'Escape') return;
+  document.getElementById('notifPanel').classList.add('hidden');
+  closeProfile();
 });
 
 /* ============================================================

@@ -26,7 +26,15 @@
         <input type="email" id="loginEmail" placeholder="you@company.com" autocomplete="email">
       </label>
       <label>Access code
-        <input type="password" id="loginCode" placeholder="Your access code" autocomplete="current-password">
+        <span class="pw-wrap">
+          <input type="password" id="loginCode" placeholder="Your access code" autocomplete="current-password">
+          <button type="button" class="pw-toggle" id="pwToggle" onclick="togglePassword()" aria-label="Show access code" aria-pressed="false" title="Show access code">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>
+              <line class="pw-slash" x1="4" y1="4" x2="20" y2="20"/>
+            </svg>
+          </button>
+        </span>
       </label>
       <button class="btn btn-primary btn-block" id="loginBtn" onclick="doLogin()">Sign in</button>
       <p class="login-error" id="loginError"></p>
@@ -43,16 +51,6 @@
       <button class="icon-btn sidebar-close" onclick="toggleSidebar(false)" aria-label="Close menu">&times;</button>
     </div>
     <nav class="sidebar-nav" id="sidebarNav"></nav>
-    <div class="sidebar-user">
-      <div class="avatar" id="userAvatar">?</div>
-      <div class="sidebar-user-meta">
-        <strong id="userName">—</strong>
-        <span id="userRole">—</span>
-      </div>
-    </div>
-    <div class="sidebar-logout">
-      <button class="btn logout-btn" onclick="logout()">⎋&nbsp; Logout</button>
-    </div>
   </aside>
 
   <main class="main">
@@ -64,7 +62,28 @@
           <button class="icon-btn" id="notifBtn" onclick="toggleNotifs()" aria-label="Notifications">🔔<span class="notif-dot hidden" id="notifDot"></span></button>
           <div class="notif-panel hidden" id="notifPanel"></div>
         </div>
-        <button class="btn btn-ghost" onclick="refreshView()" title="Refresh data">↻ Refresh</button>
+        <button class="btn btn-ghost" onclick="refreshView()" title="Refresh data">↻<span class="refresh-label"> Refresh</span></button>
+        <div class="profile-wrap">
+          <button class="profile-btn" id="profileBtn" onclick="toggleProfile()" aria-haspopup="true" aria-expanded="false" aria-label="Your profile">
+            <span class="avatar" id="userAvatar">?</span>
+            <span class="profile-name" id="userFirstName">—</span>
+            <span class="profile-caret" aria-hidden="true">▾</span>
+          </button>
+          <div class="profile-panel hidden" id="profilePanel">
+            <div class="profile-head">
+              <span class="avatar avatar-lg" id="userAvatarLg">?</span>
+              <div class="profile-meta">
+                <strong id="userName">—</strong>
+                <span id="userEmail">—</span>
+              </div>
+            </div>
+            <dl class="profile-rows">
+              <div><dt>Role</dt><dd id="userRole">—</dd></div>
+              <div><dt>Department</dt><dd id="userDept">—</dd></div>
+            </dl>
+            <button class="btn profile-logout" onclick="logout()">Log out</button>
+          </div>
+        </div>
       </div>
     </header>
     <div class="view-container" id="viewContainer"></div>
