@@ -3,6 +3,7 @@
  * Vanilla JS single-page app · Google Apps Script backend
  * ============================================================ */
 
+var FRONTEND_VERSION = 'v2.3.1';   // shown on the login screen; sent with every request so the backend knows what this page expects
 var CONFIG = {
   // Paste your Apps Script Web App URL here (ends in /exec)
   API_URL: 'https://script.google.com/macros/s/AKfycbyhbU_YmsETzJxY5YWoie5tGGvCSx-hpjUpd6MwDBTUzqJyUvfl3SyS8M7lxj_90MXVnQ/exec'
@@ -117,7 +118,7 @@ async function apiOnce(action, payload) {
       res = await fetch(CONFIG.API_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // avoids CORS preflight
-        body: JSON.stringify({ action: action, token: state.token, payload: payload || {} }),
+        body: JSON.stringify({ action: action, token: state.token, payload: payload || {}, v: FRONTEND_VERSION }),
         signal: ctrl ? ctrl.signal : undefined
       });
     } catch (e) {
@@ -772,7 +773,8 @@ function eyebrowHtml() {
   var c = state.lastCall;
   if (c && c.action === 'dashboard') {
     s += ' · loaded in ' + (c.total / 1000).toFixed(1) + ' s';
-    if (c.server != null) s += ' (server ' + (c.server / 1000).toFixed(1) + ' s' + (c.cached ? ', cached' : '') + (c.version ? ', ' + esc(c.version) : '') + ')';
+    if (c.server != null) s += ' (server ' + (c.server / 1000).toFixed(1) + ' s' + (c.cached ? ', cached' : '') + ')';
+    s += ' · page ' + FRONTEND_VERSION + (c.version ? ', backend ' + esc(c.version) : '');
   }
   return s;
 }
@@ -838,9 +840,10 @@ function needsNewBackend(d) {
 function paintAdminDashboard(c, d) {
   destroyCharts();
   needsNewBackend(d);
-  var k = d.counts, e = d.eod, ov = d.overdue, cu = d.comingUp, ts = d.todayStats;
+  var k = d.counts, e = d.eod || { submitted: 0, pending: [] }, ov = d.overdue, cu = d.comingUp || { count: 0, top: [] }, ts = d.todayStats || { total: 0, done: 0 };
   var t = d.today || todayStr();
   var overdueTop = ov.top || [];
+  cu.top = cu.top || []; e.pending = e.pending || [];
   computeNotifs(overdueTop);
   var completed = k.completed;
 
@@ -978,7 +981,7 @@ function paintAdminDashboard(c, d) {
 function paintEmployeeDashboard(c, d) {
   destroyCharts();
   needsNewBackend(d);
-  var k = d.counts, e = d.eod, ts = d.todayStats;
+  var k = d.counts, e = d.eod || {}, ts = d.todayStats || { total: 0, done: 0 };
   var t = d.today || todayStr();
   var todays = d.todays || [];                                  // sorted by time on the server
   var carried = (d.carried && d.carried.top) || [];             // overdue first, then oldest
@@ -1063,7 +1066,7 @@ async function renderTickets(c, opts) {
   var wait = [api('listTickets', req)];
   if (isAdmin && !state.users.length) wait.push(api('listUsers').catch(function() { return []; }));
   var got = await Promise.all(wait);
-  state.tickets = got[0];
+  state.tickets = got[0] || [];
   if (got[1] && got[1].length) state.users = got[1];
   state._ticketsAll = !!o.all;
   state._ticketLimit = TICKET_PAGE;
@@ -1129,7 +1132,7 @@ function applyFilters() {
   var dt = (document.getElementById('fDate') || {}).value || '';
   var t = todayStr();
 
-  var list = state.tickets.filter(function(x) {
+  var list = (state.tickets || []).filter(function(x) {
     if (state._preset === 'upcoming' && !(x['Scheduled Date'] > t && x['Status'] !== 'Completed' && x['Status'] !== 'Cancelled')) return false;
     if (st && x['Status'] !== st) return false;
     if (pr && x['Priority'] !== pr) return false;
@@ -1692,7 +1695,7 @@ async function filterAdminEOD() {
     } catch (e) { toast(e.message, 'error'); }
     if (document.getElementById('eodDate').value !== d) return;      // the user moved on while we were loading
   }
-  var list = state._eodLogs.filter(function(l) {
+  var list = (state._eodLogs || []).filter(function(l) {
     if (d && l['Date'] !== d) return false;
     if (emp && l['Employee ID'] !== emp) return false;
     return true;
@@ -1889,4 +1892,8 @@ document.getElementById('loginCode').addEventListener('keydown', function(e) {
   });
 });
 applyTheme(currentTheme());
+(function() {   // version on the login screen, so it is obvious which page the browser is running
+  var brand = document.querySelector('.login-brand p');
+  if (brand) brand.textContent += ' · app ' + FRONTEND_VERSION;
+})();
 if (state.token && state.user) enterApp();

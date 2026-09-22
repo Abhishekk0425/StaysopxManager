@@ -112,7 +112,7 @@ In-app notifications (new ticket, due soon, overdue, EOD pending) are derived au
 1. Apps Script editor: replace the whole of `Code.gs` with the new file. Run `setupDatabase` once — it only adds what is missing (the `ARCHIVE_AFTER_DAYS` setting and the archive tab).
 2. If the Tickets tab already holds thousands of rows, run `archiveOldTickets` once from the editor.
 3. Deploy → Manage deployments → edit → New version → Deploy.
-4. Upload the new `script.js` to your host. Everyone presses Ctrl+F5 once.
+4. Upload the new `index.html` and `script.js` to your host (index.html carries the `?v=` cache-buster that makes the new script load). Everyone presses Ctrl+F5 once.
 5. Add the weekly `archiveOldTickets` trigger.
 6. If anything is still slow: Admin → Settings → **Run performance check**, then use the maintenance buttons it points to.
 
@@ -123,8 +123,9 @@ The old and new front end and back end are compatible in both directions, so the
 | Symptom | Fix |
 |---|---|
 | "Backend not configured" | Paste your `/exec` URL into `CONFIG.API_URL` in script.js |
+| "Cannot read properties of undefined" on the dashboard | The browser is running an older page than the backend. Upload the new `index.html` + `script.js`, wait 2 minutes, Ctrl+F5. The login screen should show the new app version |
 | Login fails for a valid user | Check Status = `Active` and the Access Code column; emails are case-insensitive |
 | Recurring tickets not appearing | Confirm the `dailyScheduler` trigger exists, the template is `Active`, and today is inside its start/end window |
 | Times look wrong | Set the Apps Script project timezone (step 2.3) and redeploy |
 | Changes to Code.gs not taking effect | You must deploy a **New version** (step 3.6) |
-| Dashboard slow, times out, or shows "The backend is busy" | Open the `/exec` URL: it must say `v2.3`. Run `diagnose` and read the Execution log; run `fixDateFormats` if it reports date-typed cells; run `archiveOldTickets` and add its weekly trigger |
+| Dashboard slow, times out, or shows "The backend is busy" | Open the `/exec` URL: it must say `v2.3.1`. Run `diagnose` and read the Execution log; run `fixDateFormats` if it reports date-typed cells; run `archiveOldTickets` and add its weekly trigger |

@@ -47,7 +47,7 @@ HEADERS[DB.SETTINGS] = ['Key','Value','Description'];
 HEADERS[DB.ARCHIVE] = HEADERS[DB.TICKETS];
 
 var TZ = Session.getScriptTimeZone();
-var APP_VERSION = 'v2.3';
+var APP_VERSION = 'v2.3.1';
 var _cacheHits = 0, _cacheMisses = 0, _t0 = Date.now();   // per-request timing, reported back to the app
 
 /* How long a read result may be served from cache while nothing has been written (any write through the app
@@ -154,7 +154,7 @@ function doPost(e) {
       case 'requestReset':     out = requestReset(p); break;
       case 'resetPassword':    out = resetPassword(p); break;
       case 'bootstrap':        out = bootstrap(user); break;
-      case 'dashboard':        out = dashboard(user); break;
+      case 'dashboard':        out = dashboard(user, String(req.v || '') < 'v2.3'); break;   // pages older than v2.3 get the old reply shape
       case 'listTickets':      out = listTickets(user, p); break;
       case 'getTicket':        out = getTicket(user, p); break;
       case 'createTicket':     out = createTicket(user, p); break;
@@ -1072,17 +1072,17 @@ function byTimeToday(a, b) {
 }
 function isPending(s) { return s === 'Open' || s === 'In Progress' || s === 'On Hold'; }
 
-function dashboard(user) {
+function dashboard(user, legacy) {
   var isAdmin = user.role === 'Admin';
   var t = today();
-  return cached('dash|' + (isAdmin ? 'admin' : user.id) + '|' + t, function() {
+  return cached('dash|' + (isAdmin ? 'admin' : user.id) + '|' + t + (legacy ? '|legacy' : ''), function() {
     var live = scopeTickets(user, LITE).filter(function(x) { return x['Status'] !== 'Cancelled'; });
     var users = rows(DB.USERS);
     var names = {};
     users.forEach(function(u) { names[u['User ID']] = u['Name']; });
 
     var counts = { total: live.length, open: 0, inProgress: 0, onHold: 0, overdue: 0, completed: 0 };
-    var overdue = [], todays = [], carried = [], week = {}, team = {};
+    var overdue = [], todays = [], carried = [], week = {}, team = {}, legacyList = [];
     var prio = { Critical: 0, High: 0, Medium: 0, Low: 0 }, active = 0;
     var weekFrom = dateMinus(6);
     if (isAdmin) users.forEach(function(u) {
@@ -1099,6 +1099,7 @@ function dashboard(user) {
       else if (s === 'Overdue') counts.overdue++;
       else if (s === 'Completed') counts.completed++;
       if (s === 'Overdue') overdue.push(x);
+      if (legacy && (act || sd === t)) legacyList.push(slimTicket(x));   // old pages compute everything from this list
       if (sd === t) todays.push(x);
       else if (!isAdmin && act && sd < t) carried.push(x);
       if (act) { active++; prio[x['Priority']] = (prio[x['Priority']] || 0) + 1; }
@@ -1130,6 +1131,7 @@ function dashboard(user) {
       comingUp: { count: comingUp.length, top: comingUp.slice(0, TOP_COMING).map(slimTicket) },
       active: active, prio: prio
     };
+    if (legacy) out.tickets = legacyList.sort(bySchedule);
 
     var todayLogs = eodIndex(Math.max(300, users.length * 3)).filter(function(r) { return r.date === t; });
     var submitted = {};

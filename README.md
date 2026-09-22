@@ -85,7 +85,7 @@ There is no separate server or SQL database. The front end is three static files
 
 ## Updating the app
 
-**Front end** (`index.html`, `script.js`, `style.css`): upload the new files to this repository with **Add file → Upload files** and commit. The site republishes in a minute or two. Press Ctrl+F5 in the browser to load the new version.
+**Front end** (`index.html`, `script.js`, `style.css`): upload the new files to this repository with **Add file → Upload files** and commit. Always upload `index.html` together with `script.js`: it references `script.js?v=…`, and that version number is what makes browsers and GitHub Pages fetch the new file instead of a cached copy. The login screen shows the page version ("app v2.3.1") and the dashboard shows both page and backend versions.
 
 **Backend** (`Code.gs`): paste the new code into the Apps Script editor, run `setupDatabase` once (it only adds anything that is missing, such as new settings or the archive tab), then **Deploy → Manage deployments → edit → New version → Deploy**. The URL stays the same. Without a new version, the change does not go live.
 
