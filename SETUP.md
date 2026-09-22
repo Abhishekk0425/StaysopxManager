@@ -51,11 +51,12 @@ In the Apps Script editor, open **Triggers (clock icon) → Add Trigger**, twice
 |---|---|---|
 | `dailyScheduler` | Time-driven | Day timer · **5am–6am** |
 | `markOverdueTickets` | Time-driven | Hour timer · **Every hour** |
-| `archiveOldTickets` (optional) | Time-driven | Month timer · **1st of the month** |
+| `archiveOldTickets` | Time-driven | Week timer · **Sunday, early morning** |
+| `expireOverdueRecurring` (optional) | Time-driven | Day timer · **6am–7am** — only if recurring tickets pile up as Overdue |
 
 - `dailyScheduler` reads every **Active** recurring template, generates today's tickets, and skips anything already generated (duplicate-proof).
 - `markOverdueTickets` flips Open / In Progress / On Hold tickets to **Overdue** once past their due date + scheduled time, and logs the change to Ticket Activity. All changes are written in a handful of calls, however many tickets are late.
-- `archiveOldTickets` moves Completed / Cancelled tickets scheduled more than `ARCHIVE_AFTER_DAYS` days ago (default 120) into a **Tickets Archive** tab. This keeps the live Tickets tab small so every screen stays fast. Reports still include archived tickets; the ticket list and dashboard do not show them.
+- `archiveOldTickets` moves Completed / Cancelled tickets scheduled more than `ARCHIVE_AFTER_DAYS` days ago (default 60) into a **Tickets Archive** tab. This keeps the live Tickets tab small so every screen stays fast. Reports still include archived tickets; the ticket list and dashboard do not show them.
 
 ## 5. User management
 
@@ -93,6 +94,7 @@ Admin → **Settings** in the app, or edit the Settings tab directly:
 | `FREQUENCIES` | Ticket types |
 | `APP_NAME` | Display name |
 | `ARCHIVE_AFTER_DAYS` | Age (days) after which finished tickets are moved to the archive by `archiveOldTickets` |
+| `EXPIRE_AFTER_DAYS` | Recurring tickets still Overdue this many days after their due date are marked Expired by `expireOverdueRecurring` |
 
 ## 9. Security model
 
@@ -111,7 +113,8 @@ In-app notifications (new ticket, due soon, overdue, EOD pending) are derived au
 2. If the Tickets tab already holds thousands of rows, run `archiveOldTickets` once from the editor.
 3. Deploy → Manage deployments → edit → New version → Deploy.
 4. Upload the new `script.js` to your host. Everyone presses Ctrl+F5 once.
-5. Add the optional monthly `archiveOldTickets` trigger.
+5. Add the weekly `archiveOldTickets` trigger.
+6. If anything is still slow: Admin → Settings → **Run performance check**, then use the maintenance buttons it points to.
 
 The old and new front end and back end are compatible in both directions, so the order of steps 3 and 4 does not matter.
 
@@ -124,4 +127,4 @@ The old and new front end and back end are compatible in both directions, so the
 | Recurring tickets not appearing | Confirm the `dailyScheduler` trigger exists, the template is `Active`, and today is inside its start/end window |
 | Times look wrong | Set the Apps Script project timezone (step 2.3) and redeploy |
 | Changes to Code.gs not taking effect | You must deploy a **New version** (step 3.6) |
-| Dashboard slow, times out, or shows "The backend is busy" | Run `archiveOldTickets` from the editor and add its monthly trigger. Confirm the app is on the v2 `Code.gs` (it has a `dashboard` function) and a new version was deployed |
+| Dashboard slow, times out, or shows "The backend is busy" | Open the `/exec` URL: it must say `v2.3`. Run `diagnose` and read the Execution log; run `fixDateFormats` if it reports date-typed cells; run `archiveOldTickets` and add its weekly trigger |

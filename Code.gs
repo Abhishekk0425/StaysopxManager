@@ -47,10 +47,18 @@ HEADERS[DB.SETTINGS] = ['Key','Value','Description'];
 HEADERS[DB.ARCHIVE] = HEADERS[DB.TICKETS];
 
 var TZ = Session.getScriptTimeZone();
+var APP_VERSION = 'v2.3';
+var _cacheHits = 0, _cacheMisses = 0, _t0 = Date.now();   // per-request timing, reported back to the app
 
-/* How long a read result may be served from cache. Any write through the app clears it immediately,
- * so this only limits how long a change made DIRECTLY in the Google Sheet takes to show up. */
+/* How long a read result may be served from cache while nothing has been written (any write through the app
+ * makes it obsolete). This only limits how long a change made DIRECTLY in the Google Sheet takes to show up. */
 var CACHE_SECONDS = 120;
+/* A result may still be served for this long after a write by SOMEONE ELSE, so a busy team shares one sheet
+ * read instead of each person triggering a full read. A person's own writes always show immediately. */
+var STALE_OK_MS = 30 * 1000;
+var WRITE_ACTIONS = { createTicket: 1, updateTicket: 1, updateStatus: 1, addComment: 1, cancelTicket: 1, createRecurring: 1,
+  updateRecurring: 1, submitEOD: 1, addUser: 1, updateUser: 1, updateSetting: 1, maintenance: 1 };
+var _reqUser = null;
 
 /* Statuses that mean "still to be done" */
 var ACTIVE = { 'Open': 1, 'In Progress': 1, 'On Hold': 1, 'Overdue': 1 };
@@ -65,7 +73,8 @@ var DEFAULT_SETTINGS = [
   ['DEPARTMENTS', 'Operations,Housekeeping,F&B,Maintenance,Finance,Sales,Tech', 'Departments'],
   ['FREQUENCIES', 'One-Time,Daily,Weekly,Monthly', 'Ticket types'],
   ['APP_NAME', 'Stayopx Manager', 'Application display name'],
-  ['ARCHIVE_AFTER_DAYS', '120', 'archiveOldTickets moves Completed/Cancelled tickets older than this many days to the archive tab']
+  ['ARCHIVE_AFTER_DAYS', '60', 'archiveOldTickets moves Completed/Cancelled tickets older than this many days to the archive tab'],
+  ['EXPIRE_AFTER_DAYS', '14', 'expireOverdueRecurring marks recurring tickets still Overdue this many days after their due date as Expired']
 ];
 
 /* ============================================================
@@ -115,10 +124,11 @@ function setupDatabase() {
  * HTTP ENTRY POINTS
  * ============================================================ */
 function doGet() {
-  return json({ ok: true, data: 'Stayopx Manager API is running' });
+  return json({ ok: true, data: 'Stayopx Manager API ' + APP_VERSION + ' is running' });
 }
 
 function doPost(e) {
+  _t0 = Date.now(); _memo = {}; _cacheHits = 0; _cacheMisses = 0; _reqUser = null;   // fresh per request
   try {
     if (!e || !e.postData || !e.postData.contents) return json({ ok: false, error: 'BAD_REQUEST', message: 'Empty request.' });
     var req = JSON.parse(e.postData.contents);
@@ -130,9 +140,10 @@ function doPost(e) {
     if (publicActions.indexOf(action) === -1) {
       user = validateToken(req.token);
       if (!user) return json({ ok: false, error: 'SESSION_EXPIRED', message: 'Your session has expired. Please sign in again.' });
+      _reqUser = user;
     }
 
-    var adminOnly = ['updateTicket','createRecurring','updateRecurring','listUsers','addUser','updateUser','adminKPIs','listAllEOD','updateSetting','reportData'];
+    var adminOnly = ['updateTicket','createRecurring','updateRecurring','listUsers','addUser','updateUser','adminKPIs','listAllEOD','updateSetting','reportData','diagnose','maintenance'];
     if (adminOnly.indexOf(action) !== -1 && user.role !== 'Admin') {
       return json({ ok: false, error: 'FORBIDDEN', message: 'You do not have permission to perform this action.' });
     }
@@ -164,12 +175,20 @@ function doPost(e) {
       case 'addUser':          out = addUser(p); break;
       case 'updateUser':       out = updateUser(p); break;
       case 'updateSetting':    out = updateSetting(p); break;
+      case 'diagnose':         out = { report: diagnose() }; break;
+      case 'maintenance':      out = maintenance(p); break;
       default: return json({ ok: false, error: 'UNKNOWN_ACTION', message: 'Unknown action: ' + action });
     }
-    return json({ ok: true, data: out });
+    if (user && WRITE_ACTIONS[action]) { try { cache().put('dirty_' + user.id, '1', 60); } catch (e2) {} }   // their next read must be fresh
+    return json({ ok: true, data: out, meta: meta() });
   } catch (err) {
-    return json({ ok: false, error: 'SERVER_ERROR', message: friendlyError(err) });
+    return json({ ok: false, error: 'SERVER_ERROR', message: friendlyError(err), meta: meta() });
   }
+}
+
+/* How long this request spent inside the script, and whether it was answered from cache. The app shows it on the dashboard. */
+function meta() {
+  return { v: APP_VERSION, ms: Date.now() - _t0, cached: _cacheHits > 0 && _cacheMisses === 0 };
 }
 
 function friendlyError(err) {
@@ -331,21 +350,48 @@ function sheet(name) { return ss().getSheetByName(name); }
 
 /* Each tab is read at most once per request; writes clear the copy so the next read is fresh. */
 var _memo = {};
-function forget(name) { delete _memo[name]; }
+function forget(name) {
+  Object.keys(_memo).forEach(function(k) { if (k === name || k.indexOf(name + '#') === 0) delete _memo[k]; });
+}
 
-function rows(name) {
-  if (_memo[name]) return _memo[name];
+/* rows(name, LITE) reads everything except the Description column — the bulk of the text in the Tickets tab.
+ * Every screen except the ticket list and the ticket modal uses it. */
+var LITE = { skip: ['Description'] };
+
+function rows(name, opts) {
+  var skip = (opts && opts.skip) || [];
+  var key = name + (skip.length ? '#' + skip.join(',') : '');
+  if (_memo[key]) return _memo[key];
   var sh = sheet(name);
   var out = [];
   if (sh) {
     var last = sh.getLastRow();
     if (last >= 2) {
       var head = HEADERS[name];
-      out = toObjects(name, sh.getRange(2, 1, last - 1, head.length).getValues(), 2);
+      var data = skip.length ? readSkipping(sh, last, head, skip) : sh.getRange(2, 1, last - 1, head.length).getValues();
+      out = toObjects(name, data, 2);
     }
   }
-  _memo[name] = out;
+  _memo[key] = out;
   return out;
+}
+
+/* Reads the wanted columns in contiguous blocks and leaves '' in the skipped ones. */
+function readSkipping(sh, last, head, skip) {
+  var n = head.length, rowsN = last - 1, c = 0, blocks = [];
+  while (c < n) {
+    if (skip.indexOf(head[c]) !== -1) { c++; continue; }
+    var start = c;
+    while (c < n && skip.indexOf(head[c]) === -1) c++;
+    blocks.push([start, c - start]);
+  }
+  var data = new Array(rowsN);
+  for (var i = 0; i < rowsN; i++) { var r = new Array(n); for (var j = 0; j < n; j++) r[j] = ''; data[i] = r; }
+  blocks.forEach(function(b) {
+    var vals = sh.getRange(2, b[0] + 1, rowsN, b[1]).getValues();
+    for (var i2 = 0; i2 < rowsN; i2++) for (var j2 = 0; j2 < b[1]; j2++) data[i2][b[0] + j2] = vals[i2][j2];
+  });
+  return data;
 }
 
 /* The last `count` data rows of a tab. Used for append-mostly tabs (EOD logs) where today's rows are always at the bottom. */
@@ -369,10 +415,19 @@ function toObjects(name, data, firstRow) {
   return out;
 }
 
+/* Cells should all be text (setupDatabase formats the date/time columns that way). If a cell is a real Date
+ * anyway, it is converted here with plain arithmetic — Utilities.formatDate costs ~1 ms per cell, which on a
+ * big tab turned into minutes. Run fixDateFormats() once to convert such cells to text for good. */
 function normalize(v) {
-  if (v instanceof Date) return Utilities.formatDate(v, TZ, 'yyyy-MM-dd');
+  if (v instanceof Date) {
+    if (v.getFullYear() < 1900) return pad2(v.getHours()) + ':' + pad2(v.getMinutes());        // a time-only cell like 09:00
+    var s = v.getFullYear() + '-' + pad2(v.getMonth() + 1) + '-' + pad2(v.getDate());
+    if (v.getHours() || v.getMinutes() || v.getSeconds()) s += ' ' + pad2(v.getHours()) + ':' + pad2(v.getMinutes()) + ':' + pad2(v.getSeconds());
+    return s;
+  }
   return v === null || v === undefined ? '' : String(v);
 }
+function pad2(n) { return (n < 10 ? '0' : '') + n; }
 
 /* Find the rows of one tab where `header` equals `value`, using the sheet's own text search
  * instead of downloading the whole tab. Falls back to a full scan if the search is unavailable. */
@@ -517,12 +572,21 @@ function cachePutObj(key, obj, seconds) {
   } catch (e) { return false; }
 }
 function cached(key, fn) {
-  var full = key + '|' + dataVersion();
-  if (full.length > 240) return fn();                  // key too long to cache — just compute
-  var hit = cacheGetObj(full);
-  if (hit && hit.v !== undefined) return hit.v;
+  if (key.length > 240) return fn();                   // key too long to cache — just compute
+  var ver = dataVersion();
+  var dirtyKey = _reqUser ? 'dirty_' + _reqUser.id : null;
+  var dirty = dirtyKey ? cache().get(dirtyKey) : null;
+  if (!dirty) {
+    var hit = cacheGetObj(key);
+    if (hit && hit.v !== undefined && hit.at) {
+      var age = Date.now() - hit.at;
+      if ((hit.ver === ver && age < CACHE_SECONDS * 1000) || age < STALE_OK_MS) { _cacheHits++; return hit.v; }
+    }
+  }
+  _cacheMisses++;
   var v = fn();
-  cachePutObj(full, { v: v }, CACHE_SECONDS);
+  cachePutObj(key, { v: v, ver: ver, at: Date.now() }, CACHE_SECONDS);
+  if (dirty) { try { cache().remove(dirtyKey); } catch (e) {} }
   return v;
 }
 
@@ -548,8 +612,8 @@ function logActivity(ticketId, userName, prevStatus, newStatus, comment) {
 /* ============================================================
  * TICKETS
  * ============================================================ */
-function scopeTickets(user) {
-  var all = rows(DB.TICKETS);
+function scopeTickets(user, opts) {
+  var all = rows(DB.TICKETS, opts);
   if (user.role === 'Admin') return all;
   return all.filter(function(t) { return t['Assigned To'] === user.id; });
 }
@@ -768,7 +832,7 @@ function generateForDate(dateStr) {
     var lastDom = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
 
     var existing = {};
-    rows(DB.TICKETS).forEach(function(t) {
+    rows(DB.TICKETS, LITE).forEach(function(t) {
       if (t['Parent Ticket ID'] && t['Scheduled Date'] === dateStr) existing[t['Parent Ticket ID']] = true;
     });
 
@@ -824,7 +888,7 @@ function markOverdueTickets() {
   return withLock(30000, function() {
     var now = new Date();
     var hits = [];
-    rows(DB.TICKETS).forEach(function(t) {
+    rows(DB.TICKETS, LITE).forEach(function(t) {
       if (['Open', 'In Progress', 'On Hold'].indexOf(t['Status']) === -1) return;
       if (!t['Due Date']) return;
       var due = parseDate(t['Due Date']);
@@ -858,7 +922,7 @@ function markOverdueTickets() {
  * The activity log is left untouched.
  */
 function archiveOldTickets() {
-  var days = Number(settingsMap()['ARCHIVE_AFTER_DAYS']) || 120;
+  var days = Number(settingsMap()['ARCHIVE_AFTER_DAYS']) || 60;
   var cutoff = dateMinus(days);
   var head = HEADERS[DB.TICKETS];
   return withLock(120000, function() {
@@ -932,7 +996,7 @@ function submitEOD(user, p) {
     return r['Employee ID'] === user.id && r['Date'] === date;
   })[0];
 
-  var mine = rows(DB.TICKETS).filter(function(t) {
+  var mine = rows(DB.TICKETS, LITE).filter(function(t) {
     return t['Assigned To'] === user.id && t['Scheduled Date'] === date && t['Status'] !== 'Cancelled';
   });
   var completed = mine.filter(function(t) { return t['Status'] === 'Completed'; }).length;
@@ -995,40 +1059,87 @@ function cleanRow(sheetName) {
 }
 
 /* ============================================================
- * DASHBOARD — one call, everything the dashboard shows
+ * DASHBOARD — one call, everything the dashboard shows.
+ * Totals, priority mix and team workload are computed here; only the rows that are actually drawn are sent
+ * (8 oldest overdue, 6 coming up, an employee's today + 50 oldest carried-over), so the reply stays a few KB
+ * however large the backlog gets — which also means it always fits in the cache.
  * ============================================================ */
+var TOP_OVERDUE = 8, TOP_COMING = 6, TOP_CARRIED = 50, TOP_TODAY = 200;
+
+function oldestFirst(a, b) { return String(a['Due Date'] || a['Scheduled Date']).localeCompare(String(b['Due Date'] || b['Scheduled Date'])); }
+function byTimeToday(a, b) {
+  return ((b['Status'] === 'In Progress') - (a['Status'] === 'In Progress')) || (a['Scheduled Time'] || '99').localeCompare(b['Scheduled Time'] || '99');
+}
+function isPending(s) { return s === 'Open' || s === 'In Progress' || s === 'On Hold'; }
+
 function dashboard(user) {
   var isAdmin = user.role === 'Admin';
   var t = today();
   return cached('dash|' + (isAdmin ? 'admin' : user.id) + '|' + t, function() {
-    var live = scopeTickets(user).filter(function(x) { return x['Status'] !== 'Cancelled'; });
+    var live = scopeTickets(user, LITE).filter(function(x) { return x['Status'] !== 'Cancelled'; });
+    var users = rows(DB.USERS);
+    var names = {};
+    users.forEach(function(u) { names[u['User ID']] = u['Name']; });
+
     var counts = { total: live.length, open: 0, inProgress: 0, onHold: 0, overdue: 0, completed: 0 };
-    var tickets = [];
-    var weekFrom = dateMinus(6), week = {};
+    var overdue = [], todays = [], carried = [], week = {}, team = {};
+    var prio = { Critical: 0, High: 0, Medium: 0, Low: 0 }, active = 0;
+    var weekFrom = dateMinus(6);
+    if (isAdmin) users.forEach(function(u) {
+      if (u['Role'] === 'Employee' && u['Status'] === 'Active') {
+        team[u['User ID']] = { id: u['User ID'], name: u['Name'], isEmp: true, today: 0, todayDone: 0, pending: 0, overdue: 0 };
+      }
+    });
+
     for (var i = 0; i < live.length; i++) {
-      var x = live[i], s = x['Status'], sd = x['Scheduled Date'];
+      var x = live[i], s = x['Status'], sd = x['Scheduled Date'], act = !!ACTIVE[s];
       if (s === 'Open') counts.open++;
       else if (s === 'In Progress') counts.inProgress++;
       else if (s === 'On Hold') counts.onHold++;
       else if (s === 'Overdue') counts.overdue++;
       else if (s === 'Completed') counts.completed++;
-      if (ACTIVE[s] || sd === t) tickets.push(slimTicket(x));          // only what the dashboard actually shows
-      if (isAdmin && sd >= weekFrom && sd <= t) {
-        var w = week[sd] || (week[sd] = { total: 0, completed: 0 });
-        w.total++;
-        if (s === 'Completed') w.completed++;
+      if (s === 'Overdue') overdue.push(x);
+      if (sd === t) todays.push(x);
+      else if (!isAdmin && act && sd < t) carried.push(x);
+      if (act) { active++; prio[x['Priority']] = (prio[x['Priority']] || 0) + 1; }
+      if (isAdmin) {
+        if (sd >= weekFrom && sd <= t) {
+          var w = week[sd] || (week[sd] = { total: 0, completed: 0 });
+          w.total++;
+          if (s === 'Completed') w.completed++;
+        }
+        if (act || sd === t) {
+          var id = x['Assigned To'];
+          var m = team[id] || (team[id] = { id: id, name: names[id] || id, isEmp: false, today: 0, todayDone: 0, pending: 0, overdue: 0 });
+          if (sd === t) { m.today++; if (s === 'Completed') m.todayDone++; }
+          if (isPending(s)) m.pending++;
+          if (s === 'Overdue') m.overdue++;
+        }
       }
     }
-    tickets.sort(bySchedule);
+    overdue.sort(oldestFirst);
+    todays.sort(byTimeToday);
+    var todayDone = todays.filter(function(x) { return x['Status'] === 'Completed'; }).length;
+    var comingUp = todays.filter(function(x) { return isPending(x['Status']); });
+    var urgent = overdue.filter(function(x) { return x['Priority'] === 'High' || x['Priority'] === 'Critical'; }).length;
 
-    var out = { today: t, settings: settingsMap(), counts: counts, tickets: tickets };
-    var users = rows(DB.USERS);
+    var out = {
+      today: t, settings: settingsMap(), counts: counts,
+      todayStats: { total: todays.length, done: todayDone },
+      overdue: { count: overdue.length, urgent: urgent, top: overdue.slice(0, TOP_OVERDUE).map(slimTicket) },
+      comingUp: { count: comingUp.length, top: comingUp.slice(0, TOP_COMING).map(slimTicket) },
+      active: active, prio: prio
+    };
+
     var todayLogs = eodIndex(Math.max(300, users.length * 3)).filter(function(r) { return r.date === t; });
     var submitted = {};
     todayLogs.forEach(function(r) { submitted[r.id] = 1; });
 
     if (isAdmin) {
       out.users = users.map(publicUser);
+      out.team = Object.keys(team).map(function(k) { return team[k]; }).sort(function(a, b) {
+        return (b.overdue - a.overdue) || (b.pending - a.pending) || a.name.localeCompare(b.name);
+      });
       out.eod = {
         submitted: todayLogs.length,
         submittedToday: !!submitted[user.id],
@@ -1043,6 +1154,9 @@ function dashboard(user) {
         out.weekSeries.push({ date: Utilities.formatDate(d, TZ, 'dd MMM'), total: w2.total, completed: w2.completed });
       }
     } else {
+      carried.sort(function(a, b) { return ((b['Status'] === 'Overdue') - (a['Status'] === 'Overdue')) || oldestFirst(a, b); });
+      out.todays = todays.slice(0, TOP_TODAY).map(slimTicket);
+      out.carried = { count: carried.length, top: carried.slice(0, TOP_CARRIED).map(slimTicket) };
       out.eod = { submittedToday: !!submitted[user.id] };
     }
     return out;
@@ -1060,14 +1174,14 @@ function countBy(list, field) {
 
 function adminKPIs(user) {
   var d = dashboard(user), c = d.counts;
-  var all = rows(DB.TICKETS).filter(function(t) { return t['Status'] !== 'Cancelled'; });
+  var all = rows(DB.TICKETS, LITE).filter(function(t) { return t['Status'] !== 'Cancelled'; });
   var names = {};
   rows(DB.USERS).forEach(function(u) { names[u['User ID']] = u['Name']; });
   var byEmp = {};
   all.forEach(function(x) { var n = names[x['Assigned To']] || x['Assigned To']; byEmp[n] = (byEmp[n] || 0) + 1; });
   return {
     total: c.total, open: c.open, inProgress: c.inProgress, completed: c.completed, overdue: c.overdue, onHold: c.onHold,
-    todayTotal: d.tickets.filter(function(x) { return x['Scheduled Date'] === d.today; }).length,
+    todayTotal: d.todayStats.total,
     pending: c.total - c.completed,
     completionRate: c.total ? Math.round(c.completed / c.total * 100) : 0,
     byStatus: countBy(all, 'Status'), byPriority: countBy(all, 'Priority'), byEmployee: byEmp,
@@ -1080,7 +1194,7 @@ function employeeKPIs(user) {
   var d = dashboard(user), c = d.counts;
   return {
     total: c.total, open: c.open, inProgress: c.inProgress, completed: c.completed, overdue: c.overdue,
-    dueToday: d.tickets.filter(function(x) { return x['Scheduled Date'] === d.today && x['Status'] !== 'Completed'; }).length,
+    dueToday: d.todayStats.total - d.todayStats.done,
     eodSubmittedToday: d.eod.submittedToday
   };
 }
@@ -1088,9 +1202,9 @@ function employeeKPIs(user) {
 function reportData(p) {
   var from = p.from || '0000-00-00';
   var to = p.to || '9999-12-31';
-  var source = rows(DB.TICKETS);
+  var source = rows(DB.TICKETS, LITE);
   // include archived tickets when the period reaches back into the archive
-  if (sheet(DB.ARCHIVE) && from < dateMinus(Number(settingsMap()['ARCHIVE_AFTER_DAYS']) || 120)) source = source.concat(rows(DB.ARCHIVE));
+  if (sheet(DB.ARCHIVE) && from < dateMinus(Number(settingsMap()['ARCHIVE_AFTER_DAYS']) || 60)) source = source.concat(rows(DB.ARCHIVE, LITE));
   var all = source.filter(function(t) {
     return t['Status'] !== 'Cancelled' && t['Scheduled Date'] >= from && t['Scheduled Date'] <= to;
   });
@@ -1106,7 +1220,7 @@ function reportData(p) {
     if (!perEmp[id]) perEmp[id] = { name: names[id] || id, total: 0, completed: 0, overdue: 0, pending: 0 };
     perEmp[id].total++;
     if (t['Status'] === 'Completed') perEmp[id].completed++;
-    else if (t['Status'] === 'Overdue') perEmp[id].overdue++;
+    else if (t['Status'] === 'Overdue' || t['Status'] === 'Expired') perEmp[id].overdue++;
     else perEmp[id].pending++;
   });
 
@@ -1128,7 +1242,7 @@ function reportData(p) {
     tickets: {
       total: all.length,
       completed: completed,
-      overdue: all.filter(function(t) { return t['Status'] === 'Overdue'; }).length,
+      overdue: all.filter(function(t) { return t['Status'] === 'Overdue' || t['Status'] === 'Expired'; }).length,
       pending: all.length - completed,
       completionRate: all.length ? Math.round(completed / all.length * 100) : 0
     },
@@ -1185,4 +1299,129 @@ function updateSetting(p) {
   if (r) updateRowObj(DB.SETTINGS, r._row, { 'Value': p.value });
   else appendRowObj(DB.SETTINGS, { 'Key': p.key, 'Value': p.value, 'Description': p.description || '' });
   return settingsMap();
+}
+
+/* ============================================================
+ * MAINTENANCE — from the app (Admin → Settings → Maintenance) or from the Apps Script editor
+ * (select the function, press Run; the report also lands in the "Diagnostics" tab of the sheet)
+ * ============================================================ */
+function maintenance(p) {
+  var task = String(p.task || '');
+  if (task === 'archive') { var n = archiveOldTickets(); return { message: n ? 'Moved ' + n + ' finished tickets to the archive tab.' : 'Nothing old enough to archive yet.' }; }
+  if (task === 'fixDates') { var f = fixDateFormats(); return { message: f ? 'Converted ' + f + ' date cells to text.' : 'No date-typed cells found — nothing to fix.' }; }
+  if (task === 'expire') { var x = expireOverdueRecurring(); return { message: x ? 'Marked ' + x + ' stale recurring tickets as Expired.' : 'No recurring tickets are stale enough to expire.' }; }
+  throw new Error('!Unknown maintenance task.');
+}
+
+/**
+ * Measures where the time goes. Returns the report, prints it to the Execution log, and appends it to the
+ * "Diagnostics" tab of the spreadsheet.
+ */
+function diagnose() {
+  var out = [], t0 = Date.now();
+  function lap(label, fn) { var s = Date.now(); var r = fn(); out.push(label + ': ' + (Date.now() - s) + ' ms'); return r; }
+  out.push('Stayopx Manager ' + APP_VERSION + ' — diagnose ' + nowStamp() + ' (' + TZ + ')');
+  [DB.TICKETS, DB.ACTIVITY, DB.EOD, DB.USERS, DB.RECURRING, DB.ARCHIVE].forEach(function(n) {
+    var sh = sheet(n);
+    out.push('Rows in ' + n + ': ' + (sh ? Math.max(0, sh.getLastRow() - 1) : '(tab missing — run setupDatabase)'));
+  });
+  var sh = sheet(DB.TICKETS), last = sh.getLastRow(), dateCells = 0, chars = 0, descChars = 0;
+  if (last >= 2) {
+    var vals = lap('Read Tickets tab (all columns)', function() { return sh.getRange(2, 1, last - 1, HEADERS[DB.TICKETS].length).getValues(); });
+    for (var i = 0; i < vals.length; i++) for (var c = 0; c < vals[i].length; c++) {
+      if (vals[i][c] instanceof Date) dateCells++;
+      else if (typeof vals[i][c] === 'string') { chars += vals[i][c].length; if (c === 3) descChars += vals[i][c].length; }
+    }
+    out.push('Date-typed cells in Tickets: ' + dateCells + (dateCells ? '   <-- run "Fix date formats"' : ' (good)'));
+    out.push('Text in Tickets tab: ' + Math.round(chars / 1024) + ' KB, of which descriptions ' + Math.round(descChars / 1024) + ' KB');
+  }
+  _memo = {};
+  var lite = lap('Read Tickets tab (without descriptions) + parse', function() { return rows(DB.TICKETS, LITE); });
+  var st = {}, staleRecurring = 0, cutoff = dateMinus(Number(settingsMap()['EXPIRE_AFTER_DAYS']) || 14), oldest = '';
+  lite.forEach(function(x) {
+    st[x['Status']] = (st[x['Status']] || 0) + 1;
+    if (x['Status'] === 'Overdue') {
+      if (!oldest || x['Scheduled Date'] < oldest) oldest = x['Scheduled Date'];
+      if (x['Parent Ticket ID'] && (x['Due Date'] || x['Scheduled Date']) < cutoff) staleRecurring++;
+    }
+  });
+  out.push('Tickets by status: ' + Object.keys(st).map(function(k) { return k + ' ' + st[k]; }).join(', '));
+  if (st['Overdue']) out.push('Oldest overdue ticket: ' + oldest + '. Recurring tickets overdue for more than ' + (Number(settingsMap()['EXPIRE_AFTER_DAYS']) || 14) + ' days: ' + staleRecurring + (staleRecurring ? '   <-- run "Expire stale recurring tickets"' : ''));
+  var ok = cachePutObj('diag_probe', { v: 'x' }, 60) && (cacheGetObj('diag_probe') || {}).v === 'x';
+  out.push('Cache working: ' + (ok ? 'yes' : 'NO — every request is recomputing'));
+  var admin = rows(DB.USERS).filter(function(u) { return u['Role'] === 'Admin' && u['Status'] === 'Active'; })[0];
+  if (admin) {
+    var u = { id: admin['User ID'], name: admin['Name'], role: 'Admin' };
+    var savedUser = _reqUser; _reqUser = null;
+    bumpVersion(); _memo = {};
+    var d = lap('Admin dashboard, cold (full sheet read)', function() { return dashboard(u); });
+    _memo = {};
+    lap('Admin dashboard, from cache', function() { return dashboard(u); });
+    out.push('Dashboard reply size: ' + Math.round(JSON.stringify(d).length / 1024) + ' KB');
+    _reqUser = savedUser;
+  }
+  out.push('Settings: ARCHIVE_AFTER_DAYS=' + (settingsMap()['ARCHIVE_AFTER_DAYS'] || '(missing)') + ', EXPIRE_AFTER_DAYS=' + (settingsMap()['EXPIRE_AFTER_DAYS'] || '(missing)'));
+  out.push('Total: ' + (Date.now() - t0) + ' ms inside the script. Google adds roughly 1.5–3 s of its own to every request on top of this.');
+  var report = out.join('\n');
+  console.log(report);
+  try {
+    var dg = sheet('Diagnostics') || ss().insertSheet('Diagnostics');
+    dg.appendRow([nowStamp(), report]);
+  } catch (e) {}
+  return report;
+}
+
+/**
+ * OPTIONAL DAILY JOB — recurring tickets that are still Overdue more than EXPIRE_AFTER_DAYS (default 14) after their
+ * due date are marked "Expired" so they stop piling up on the dashboard. They still count as missed in Reports.
+ * Run from Admin → Settings → Maintenance, from the editor, or add a daily trigger.
+ */
+function expireOverdueRecurring() {
+  var days = Number(settingsMap()['EXPIRE_AFTER_DAYS']) || 14;
+  var cutoff = dateMinus(days);
+  return withLock(60000, function() {
+    var hits = rows(DB.TICKETS, LITE).filter(function(t) {
+      return t['Status'] === 'Overdue' && t['Parent Ticket ID'] && (t['Due Date'] || t['Scheduled Date']) < cutoff;
+    });
+    if (!hits.length) return 0;
+    var sh = sheet(DB.TICKETS), head = HEADERS[DB.TICKETS];
+    var statusCol = colLetter(head.indexOf('Status') + 1), updCol = colLetter(head.indexOf('Updated Date') + 1);
+    var stamp = nowStamp();
+    for (var i = 0; i < hits.length; i += 200) {
+      var part = hits.slice(i, i + 200);
+      sh.getRangeList(part.map(function(t) { return statusCol + t._row; })).setValue('Expired');
+      sh.getRangeList(part.map(function(t) { return updCol + t._row; })).setValue(stamp);
+    }
+    var actIds = nextIds('ACT-', 'seq_activity', 50001, hits.length);
+    appendRowsObj(DB.ACTIVITY, hits.map(function(t, i) {
+      return activityRow(actIds[i], t['Ticket ID'], 'Scheduler', 'Overdue', 'Expired', 'Expired: not completed within ' + days + ' days of its due date');
+    }));
+    forget(DB.TICKETS); bumpVersion();
+    return hits.length;
+  });
+}
+
+/**
+ * One-time repair: converts any real Date/Time cells in the data tabs to plain text (yyyy-MM-dd / HH:mm)
+ * and sets those columns to text format, so reads never have to convert dates again.
+ */
+function fixDateFormats() {
+  var fixed = 0;
+  withLock(120000, function() {
+    Object.keys(DB).forEach(function(k) {
+      var name = DB[k], sh = sheet(name);
+      if (!sh || name === DB.SETTINGS) return;
+      var last = sh.getLastRow(), cols = HEADERS[name].length;
+      if (last < 2) return;
+      var range = sh.getRange(2, 1, last - 1, cols);
+      var vals = range.getValues(), changed = false;
+      for (var i = 0; i < vals.length; i++) for (var c = 0; c < cols; c++) {
+        if (vals[i][c] instanceof Date) { vals[i][c] = normalize(vals[i][c]); changed = true; fixed++; }
+      }
+      if (changed) { range.setNumberFormat('@'); range.setValues(vals); forget(name); }
+    });
+  });
+  bumpVersion();
+  console.log('Converted ' + fixed + ' date cells to text.');
+  return fixed;
 }

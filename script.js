@@ -108,7 +108,7 @@ async function api(action, payload) {
 }
 
 async function apiOnce(action, payload) {
-  var out, res, text;
+  var out, res, text, t0 = Date.now();
   var ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
   var timer = ctrl ? setTimeout(function() { ctrl.abort(); }, API_TIMEOUT_MS) : null;
   setLoading(true);
@@ -151,6 +151,8 @@ async function apiOnce(action, payload) {
     if (timer) clearTimeout(timer);
     setLoading(false);
   }
+  state.lastCall = { action: action, total: Date.now() - t0, server: out.meta ? out.meta.ms : null,
+    cached: !!(out.meta && out.meta.cached), version: out.meta ? out.meta.v : null };
   if (!out.ok) {
     if (out.error === 'SESSION_EXPIRED' && state.token) { logout(true); }
     var err = new Error(out.message || 'Request failed. Please try again.');
@@ -189,7 +191,7 @@ async function doLogin() {
 }
 
 function logout(expired) {
-  ['od_token', 'od_user', 'od_settings'].forEach(function(k) { localStorage.removeItem(k); });
+  ['od_token', 'od_user', 'od_settings', 'od_dash'].forEach(function(k) { localStorage.removeItem(k); });
   state.token = null; state.user = null;
   state.users = []; state.tickets = []; state.dash = null;
   closeProfile();
@@ -538,7 +540,7 @@ function userName(id) {
   return state.user && id === state.user.id ? state.user.name : id;
 }
 function statusBadge(s) {
-  var map = { 'Open': 'b-open', 'In Progress': 'b-progress', 'Completed': 'b-done', 'On Hold': 'b-hold', 'Overdue': 'b-late', 'Cancelled': 'b-cancel' };
+  var map = { 'Open': 'b-open', 'In Progress': 'b-progress', 'Completed': 'b-done', 'On Hold': 'b-hold', 'Overdue': 'b-late', 'Cancelled': 'b-cancel', 'Expired': 'b-cancel' };
   return '<span class="badge ' + (map[s] || 'b-neutral') + '">' + esc(s) + '</span>';
 }
 function priorityBadge(p) {
@@ -750,17 +752,29 @@ function byTimeToday(a, b) {
 
 /* the dark band at the top: greeting, one-line summary, quick actions */
 function heroBand(summary, actions) {
-  var d = new Date();
-  var day = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d.getDay()];
   return '<section class="hero">' +
     '<div class="hero-main">' +
-      '<p class="hero-eyebrow"><span class="live-dot" aria-hidden="true"></span>Live · ' + day + ', ' + fmtDate(todayStr()) +
-      ' · updated ' + nowClock() + '</p>' +
+      '<p class="hero-eyebrow">' + eyebrowHtml() + '</p>' +
       '<h2>' + esc(greeting()) + '</h2>' +
       '<p class="hero-sum">' + summary + '</p>' +
     '</div>' +
     '<div class="hero-actions">' + actions + '</div>' +
   '</section>';
+}
+/* "Live · Tue, 22 Sep 2026 · updated 10:24 · loaded in 3.1 s (server 0.4 s, cached)" — the timing tells you where the
+ * wait is: "server" is time inside the Google script (big = the Tickets tab is large); the rest is Google's own
+ * overhead per request, which no code change can remove. */
+function eyebrowHtml() {
+  var d = new Date();
+  var day = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d.getDay()];
+  var s = '<span class="live-dot" aria-hidden="true"></span>Live · ' + day + ', ' + fmtDate(todayStr()) + ' · updated ' + nowClock();
+  if (state.dashPending) return s + ' · updating…';
+  var c = state.lastCall;
+  if (c && c.action === 'dashboard') {
+    s += ' · loaded in ' + (c.total / 1000).toFixed(1) + ' s';
+    if (c.server != null) s += ' (server ' + (c.server / 1000).toFixed(1) + ' s' + (c.cached ? ', cached' : '') + (c.version ? ', ' + esc(c.version) : '') + ')';
+  }
+  return s;
 }
 function eodActionBtn(submitted) {
   if (submitted === true) return '<button class="btn hero-btn" onclick="navigate(\'eod\')">' + icon('check', 16) + 'EOD submitted</button>';
@@ -781,7 +795,13 @@ var DASH_CACHE_MS = 5 * 60 * 1000;
 
 function dashCache() {
   var d = state.dash;
-  return d && d.role === state.user.role && d.userId === state.user.id && (Date.now() - d.at) < DASH_CACHE_MS ? d.data : null;
+  if (!d) {                                                     // after a reload: the last dashboard is kept in the browser
+    try { d = JSON.parse(localStorage.getItem('od_dash') || 'null'); } catch (e) { d = null; }
+    if (d && d.data && d.data.today !== todayStr()) d = null;   // never paint another day's data as today
+    state.dash = d;
+  }
+  if (!d || d.role !== state.user.role || d.userId !== state.user.id) return null;
+  return (Date.now() - d.at) < DASH_CACHE_MS || !state.lastCall ? d.data : null;   // anything is fine as a first paint on reload
 }
 function applyDashData(d) {
   if (d.settings) {
@@ -791,31 +811,38 @@ function applyDashData(d) {
   if (d.users) state.users = d.users;
   state.tickets = d.tickets || [];
   state.dash = { role: state.user.role, userId: state.user.id, at: Date.now(), data: d };
+  try {
+    var packed = JSON.stringify(state.dash);
+    if (packed.length < 2000000) localStorage.setItem('od_dash', packed);   // keep it for the next reload
+  } catch (e) {}
 }
 async function loadDashboard(c, silent, paint) {
   var cachedData = silent ? null : dashCache();
-  if (cachedData) paint(c, cachedData);                       // instant paint from the last load
-  var d = await api('dashboard');
+  if (cachedData) { state.dashPending = true; paint(c, cachedData); }   // instant paint from the last load
+  var d;
+  try { d = await api('dashboard'); }
+  finally { state.dashPending = false; }
   var unchanged = cachedData && JSON.stringify(d) === JSON.stringify(cachedData);
   applyDashData(d);
   if (!unchanged) paint(c, d);
+  else { var eb = c.querySelector('.hero-eyebrow'); if (eb) eb.innerHTML = eyebrowHtml(); }   // just refresh the timing line
 }
 async function renderAdminDashboard(c, silent) { await loadDashboard(c, silent, paintAdminDashboard); }
 async function renderEmployeeDashboard(c, silent) { await loadDashboard(c, silent, paintEmployeeDashboard); }
 
+function needsNewBackend(d) {
+  if (d && d.overdue && d.counts) return;
+  throw new Error('The backend is running an older version than this page. Paste the new Code.gs into Apps Script and deploy a New version.');
+}
+
 function paintAdminDashboard(c, d) {
   destroyCharts();
-  var k = d.counts, e = d.eod;
+  needsNewBackend(d);
+  var k = d.counts, e = d.eod, ov = d.overdue, cu = d.comingUp, ts = d.todayStats;
   var t = d.today || todayStr();
-  var live = d.tickets;                                         // unfinished + scheduled today; cancelled already excluded
-  var overdue = live.filter(function(x) { return x['Status'] === 'Overdue'; }).sort(oldestFirst);
-  computeNotifs(overdue);
-
-  var todays = live.filter(function(x) { return x['Scheduled Date'] === t; });
-  var todayDone = todays.filter(function(x) { return x['Status'] === 'Completed'; }).length;
+  var overdueTop = ov.top || [];
+  computeNotifs(overdueTop);
   var completed = k.completed;
-  var urgent = overdue.filter(function(x) { return x['Priority'] === 'High' || x['Priority'] === 'Critical'; }).length;
-  var comingUp = todays.filter(function(x) { return isPendingStatus(x['Status']); }).sort(byTimeToday);
 
   /* --- EOD today --- */
   var eodTotal = e.submitted + e.pending.length;
@@ -824,40 +851,17 @@ function paintAdminDashboard(c, d) {
 
   /* --- one-line summary --- */
   var bits = [];
-  bits.push(overdue.length ? '<strong>' + plural(overdue.length, 'ticket is', 'tickets are') + ' overdue</strong>' +
-    (urgent ? ' (' + urgent + ' high or critical)' : '') : 'Nothing is overdue');
-  bits.push(todays.length ? todayDone + ' of ' + todays.length + ' scheduled today ' + (todayDone === 1 && todays.length === 1 ? 'is' : 'are') + ' done' : 'nothing is scheduled today');
+  bits.push(ov.count ? '<strong>' + plural(ov.count, 'ticket is', 'tickets are') + ' overdue</strong>' +
+    (ov.urgent ? ' (' + ov.urgent + ' high or critical)' : '') : 'Nothing is overdue');
+  bits.push(ts.total ? ts.done + ' of ' + ts.total + ' scheduled today ' + (ts.done === 1 && ts.total === 1 ? 'is' : 'are') + ' done' : 'nothing is scheduled today');
   if (isAfterFive() && e.pending.length) bits.push(plural(e.pending.length, 'EOD log is', 'EOD logs are') + ' still pending');
   var summary = bits.join(' · ') + '.';
 
-  /* --- active work by priority --- */
-  var active = live.filter(function(x) { return isPendingStatus(x['Status']) || x['Status'] === 'Overdue'; });
+  /* --- active work by priority (counted on the server) --- */
   var prios = [['Critical', 'late'], ['High', 'progress'], ['Medium', 'open'], ['Low', 'hold']].map(function(p) {
-    return { name: p[0], tone: p[1], n: active.filter(function(x) { return x['Priority'] === p[0]; }).length };
+    return { name: p[0], tone: p[1], n: (d.prio && d.prio[p[0]]) || 0 };
   });
-
-  /* --- team workload, per person --- */
-  var team = {};
-  state.users.forEach(function(u) {
-    if (u.role === 'Employee' && u.status === 'Active') {
-      team[u.id] = { id: u.id, name: u.name, isEmp: true, today: 0, todayDone: 0, pending: 0, overdue: 0 };
-    }
-  });
-  live.forEach(function(x) {
-    var id = x['Assigned To'];
-    var isActive = isPendingStatus(x['Status']) || x['Status'] === 'Overdue';
-    if (!team[id]) {
-      if (!isActive && x['Scheduled Date'] !== t) return;      // nothing current for this person
-      team[id] = { id: id, name: userName(id), isEmp: false, today: 0, todayDone: 0, pending: 0, overdue: 0 };
-    }
-    var m = team[id];
-    if (x['Scheduled Date'] === t) { m.today++; if (x['Status'] === 'Completed') m.todayDone++; }
-    if (isPendingStatus(x['Status'])) m.pending++;
-    if (x['Status'] === 'Overdue') m.overdue++;
-  });
-  var teamRows = Object.keys(team).map(function(id) { return team[id]; }).sort(function(a, b) {
-    return (b.overdue - a.overdue) || (b.pending - a.pending) || a.name.localeCompare(b.name);
-  });
+  var teamRows = d.team || [];
 
   c.innerHTML =
     heroBand(summary,
@@ -868,9 +872,9 @@ function paintAdminDashboard(c, d) {
     '<div class="two-col">' +
       '<div class="panel"><div class="panel-head"><h3>Today\'s tickets</h3>' +
         '<button class="btn btn-ghost btn-sm" onclick="goTickets(\'date\',\'' + t + '\')">View today</button></div>' +
-        '<div class="ring-row">' + progressRing(todayDone, todays.length) + '<div>' +
-        '<div class="progress-num"><span data-count="' + todayDone + '">' + todayDone + '</span> <small>of ' + todays.length + ' done</small></div>' +
-        '<p class="muted small">' + (todays.length ? (todays.length - todayDone) + ' still to finish today.' : 'Nothing is scheduled for today.') + '</p></div></div></div>' +
+        '<div class="ring-row">' + progressRing(ts.done, ts.total) + '<div>' +
+        '<div class="progress-num"><span data-count="' + ts.done + '">' + ts.done + '</span> <small>of ' + ts.total + ' done</small></div>' +
+        '<p class="muted small">' + (ts.total ? (ts.total - ts.done) + ' still to finish today.' : 'Nothing is scheduled for today.') + '</p></div></div></div>' +
 
       '<div class="panel"><div class="panel-head"><h3>EOD logs today</h3>' +
         '<button class="btn btn-ghost btn-sm" onclick="navigate(\'eodAdmin\')">View logs</button></div>' +
@@ -881,7 +885,7 @@ function paintAdminDashboard(c, d) {
 
     /* KPIs — click any card to open that list */
     '<div class="kpi-grid kpi-fit">' +
-      kpiCard('Overdue', overdue.length, 'k-late k-accent', urgent ? urgent + ' high or critical' : '', 'status', 'Overdue', 'alert') +
+      kpiCard('Overdue', ov.count, 'k-late k-accent', ov.urgent ? ov.urgent + ' high or critical' : '', 'status', 'Overdue', 'alert') +
       kpiCard('Open', k.open, 'k-open', 'Not started', 'status', 'Open', 'dot') +
       kpiCard('In progress', k.inProgress, 'k-progress', '', 'status', 'In Progress', 'activity') +
       kpiCard('On hold', k.onHold, 'k-hold', '', 'status', 'On Hold', 'pause') +
@@ -889,8 +893,8 @@ function paintAdminDashboard(c, d) {
     '</div>' +
 
     /* priority mix of everything still active */
-    (active.length ?
-      '<div class="panel prio-panel"><div class="prio-head"><h3>Active work by priority</h3><span class="muted small">' + plural(active.length, 'ticket', 'tickets') + ' not finished yet</span></div>' +
+    (d.active ?
+      '<div class="panel prio-panel"><div class="prio-head"><h3>Active work by priority</h3><span class="muted small">' + plural(d.active, 'ticket', 'tickets') + ' not finished yet</span></div>' +
       '<div class="prio-bar" role="img" aria-label="Priority mix">' + prios.map(function(p) {
         return p.n ? '<span class="tone-' + p.tone + '" style="flex:' + p.n + '" title="' + p.name + ': ' + p.n + '"></span>' : '';
       }).join('') + '</div>' +
@@ -901,10 +905,10 @@ function paintAdminDashboard(c, d) {
     '<div class="dash-split">' +
       /* overdue list */
       '<div class="panel"><div class="panel-head"><h3>Overdue tickets</h3>' +
-        (overdue.length > 8 ? '<button class="btn btn-ghost btn-sm" onclick="goTickets(\'status\',\'Overdue\')">View all ' + overdue.length + '</button>' :
+        (ov.count > overdueTop.length ? '<button class="btn btn-ghost btn-sm" onclick="goTickets(\'status\',\'Overdue\')">View all ' + ov.count + '</button>' :
           '<span class="muted small">Oldest first</span>') + '</div>' +
-        (overdue.length ?
-          '<div class="table-wrap scroll-y"><table class="compact"><tbody>' + overdue.slice(0, 8).map(function(x) {
+        (overdueTop.length ?
+          '<div class="table-wrap scroll-y"><table class="compact"><tbody>' + overdueTop.map(function(x) {
             return '<tr class="clickable" onclick="openTicket(\'' + esc(x['Ticket ID']) + '\')">' +
               '<td><div class="t-title">' + esc(x['Title']) + '</div><div class="t-sub"><span class="mono">' + esc(x['Ticket ID']) + '</span> · ' + esc(userName(x['Assigned To'])) + '</div></td>' +
               '<td>' + priorityBadge(x['Priority']) + '</td>' +
@@ -934,17 +938,17 @@ function paintAdminDashboard(c, d) {
     '<div class="dash-split dash-split-rev">' +
       /* coming up today */
       '<div class="panel"><div class="panel-head"><h3>Coming up today</h3>' +
-        (comingUp.length > 6 ? '<button class="btn btn-ghost btn-sm" onclick="goTickets(\'date\',\'' + t + '\')">View all ' + comingUp.length + '</button>' :
+        (cu.count > cu.top.length ? '<button class="btn btn-ghost btn-sm" onclick="goTickets(\'date\',\'' + t + '\')">View all ' + cu.count + '</button>' :
           '<span class="muted small">By scheduled time</span>') + '</div>' +
-        (comingUp.length ?
-          '<div class="upnext-list">' + comingUp.slice(0, 6).map(function(x) {
+        (cu.top.length ?
+          '<div class="upnext-list">' + cu.top.map(function(x) {
             return '<button class="upnext" onclick="openTicket(\'' + esc(x['Ticket ID']) + '\')">' +
               '<span class="upnext-time mono">' + (x['Scheduled Time'] ? fmtTime(x['Scheduled Time']) : '—') + '</span>' +
               '<span class="upnext-body"><span class="t-title">' + esc(x['Title']) + '</span><span class="t-sub">' + esc(userName(x['Assigned To'])) + '</span></span>' +
               whenLabel(x) + '</button>';
           }).join('') + '</div>' :
           '<div class="empty-state" style="padding:28px 20px"><div class="e-ico e-ok">' + icon('check', 24) + '</div><p>' +
-            (todays.length ? 'Everything scheduled for today is done.' : 'Nothing is scheduled for today.') + '</p></div>') +
+            (ts.total ? 'Everything scheduled for today is done.' : 'Nothing is scheduled for today.') + '</p></div>') +
       '</div>' +
 
       '<div class="panel"><div class="panel-head"><h3>Last 7 days</h3><span class="muted small">How much of each day\'s scheduled work got done</span></div>' +
@@ -973,22 +977,16 @@ function paintAdminDashboard(c, d) {
  * ============================================================ */
 function paintEmployeeDashboard(c, d) {
   destroyCharts();
-  var k = d.counts, e = d.eod;
+  needsNewBackend(d);
+  var k = d.counts, e = d.eod, ts = d.todayStats;
   var t = d.today || todayStr();
-  var mine = d.tickets;                                         // my unfinished tickets + everything scheduled today
-  computeNotifs(mine, e.submittedToday);
+  var todays = d.todays || [];                                  // sorted by time on the server
+  var carried = (d.carried && d.carried.top) || [];             // overdue first, then oldest
+  var carriedCount = d.carried ? d.carried.count : carried.length;
+  computeNotifs(todays.concat(carried), e.submittedToday);
 
-  var todays = mine.filter(function(x) { return x['Scheduled Date'] === t; });
-  todays.sort(function(a, b) { return (a['Scheduled Time'] || '99').localeCompare(b['Scheduled Time'] || '99'); });
-  var todayDone = todays.filter(function(x) { return x['Status'] === 'Completed'; }).length;
-  var left = todays.length - todayDone;
-
-  /* unfinished work from earlier days — overdue first, then oldest */
-  var carried = mine.filter(function(x) {
-    return x['Scheduled Date'] < t && (isPendingStatus(x['Status']) || x['Status'] === 'Overdue');
-  }).sort(function(a, b) {
-    return ((b['Status'] === 'Overdue') - (a['Status'] === 'Overdue')) || oldestFirst(a, b);
-  });
+  var todayDone = ts.done;
+  var left = ts.total - todayDone;
 
   /* what to do next: whatever is in progress, else the earliest unfinished task today, else the oldest carried-over one */
   var queue = todays.filter(function(x) { return x['Status'] !== 'Completed'; }).sort(byTimeToday);
@@ -997,8 +995,8 @@ function paintEmployeeDashboard(c, d) {
 
   var cutoff = fmtTime(state.settings.EOD_CUTOFF || '23:00');
   var bits = [];
-  bits.push(todays.length ? (left ? '<strong>' + plural(left, 'task', 'tasks') + ' left today</strong>' : '<strong>All of today\'s tasks are done</strong>') : 'Nothing is scheduled for you today');
-  if (carried.length) bits.push(plural(carried.length, 'task', 'tasks') + ' carried over from earlier days');
+  bits.push(ts.total ? (left ? '<strong>' + plural(left, 'task', 'tasks') + ' left today</strong>' : '<strong>All of today\'s tasks are done</strong>') : 'Nothing is scheduled for you today');
+  if (carriedCount) bits.push(plural(carriedCount, 'task', 'tasks') + ' carried over from earlier days');
   if (!e.submittedToday && isAfterFive()) bits.push('your EOD log is due by ' + cutoff);
   var summary = bits.join(' · ') + '.';
 
@@ -1010,9 +1008,9 @@ function paintEmployeeDashboard(c, d) {
     '<div class="two-col">' +
       '<div class="panel"><div class="panel-head"><h3>Today\'s tasks</h3>' +
         '<button class="btn btn-ghost btn-sm" onclick="navigate(\'today\')">View today</button></div>' +
-        '<div class="ring-row">' + progressRing(todayDone, todays.length) + '<div>' +
-        '<div class="progress-num"><span data-count="' + todayDone + '">' + todayDone + '</span> <small>of ' + todays.length + ' done</small></div>' +
-        '<p class="muted small">' + (todays.length ? (left ? left + ' still to finish today.' : 'All of today\'s tasks are done.') : 'Nothing is scheduled for you today.') + '</p></div></div></div>' +
+        '<div class="ring-row">' + progressRing(todayDone, ts.total) + '<div>' +
+        '<div class="progress-num"><span data-count="' + todayDone + '">' + todayDone + '</span> <small>of ' + ts.total + ' done</small></div>' +
+        '<p class="muted small">' + (ts.total ? (left ? left + ' still to finish today.' : 'All of today\'s tasks are done.') : 'Nothing is scheduled for you today.') + '</p></div></div></div>' +
 
       '<div class="panel next-up">' +
         (next ?
@@ -1039,10 +1037,15 @@ function paintEmployeeDashboard(c, d) {
 
     (carried.length ?
       '<div class="panel" style="border-left:3px solid var(--late)"><div class="panel-head"><h3>Finish these first</h3>' +
-      '<span class="muted small">Carried over from earlier days</span></div>' + ticketsTable(carried, true) + '</div>' : '') +
+      '<span class="muted small">Carried over from earlier days' +
+      (carriedCount > carried.length ? ' · showing the ' + carried.length + ' oldest of ' + carriedCount : '') + '</span></div>' + ticketsTable(carried, true) +
+      (carriedCount > carried.length ? '<div style="text-align:center;padding:12px 0 4px"><button class="btn btn-ghost btn-sm" onclick="goTickets(\'status\',\'Overdue\')">View all overdue</button></div>' : '') +
+      '</div>' : '') +
 
     '<div class="panel"><div class="panel-head"><h3>Today\'s tasks</h3><span class="muted small">' + fmtDate(t) + '</span></div>' +
-    ticketsTable(todays, true) + '</div>';
+    ticketsTable(todays, true) +
+    (ts.total > todays.length ? '<p class="muted small" style="margin-top:10px">Showing ' + todays.length + ' of ' + ts.total + '. <button type="button" class="link-btn" onclick="navigate(\'today\')">View all</button></p>' : '') +
+    '</div>';
 }
 
 /* ============================================================
@@ -1823,7 +1826,41 @@ async function renderSettings(c) {
         '<input id="set_' + s[0] + '" value="' + esc(state.settings[s[0]] || '') + '"></label>';
     }).join('') +
     '<div class="modal-actions"><button class="btn btn-primary" onclick="saveSettings()">Save settings</button></div>' +
-    '<p class="muted small" style="margin-top:14px">Changing statuses or priorities updates dropdowns across the app. Existing tickets keep their current values.</p></div>';
+    '<p class="muted small" style="margin-top:14px">Changing statuses or priorities updates dropdowns across the app. Existing tickets keep their current values.</p></div>' +
+
+    '<div class="panel" style="max-width:640px"><div class="panel-head"><h3>Maintenance &amp; performance</h3></div>' +
+    '<p class="muted small" style="margin-bottom:12px">If the app feels slow, run the check first — it tells you which of the other buttons will help.</p>' +
+    '<div class="modal-actions" style="justify-content:flex-start;flex-wrap:wrap;gap:8px">' +
+      '<button class="btn btn-primary" id="mtDiag" onclick="runDiagnose()">Run performance check</button>' +
+      '<button class="btn btn-ghost" onclick="runMaintenance(\'archive\', this, \'Archive old finished tickets\', \'Moves Completed and Cancelled tickets older than the ARCHIVE_AFTER_DAYS setting to the Tickets Archive tab. Reports still include them.\')">Archive old finished tickets</button>' +
+      '<button class="btn btn-ghost" onclick="runMaintenance(\'expire\', this, \'Expire stale recurring tickets\', \'Recurring tickets still Overdue more than EXPIRE_AFTER_DAYS days after their due date are marked Expired. They stop cluttering dashboards and still count as missed in Reports.\')">Expire stale recurring tickets</button>' +
+      '<button class="btn btn-ghost" onclick="runMaintenance(\'fixDates\', this, \'Fix date formats\', \'Converts any date-typed cells in the sheet to plain text so reads are fast. Safe to run any time.\')">Fix date formats</button>' +
+    '</div>' +
+    '<pre id="mtReport" class="muted small" style="white-space:pre-wrap;margin-top:14px;display:none"></pre></div>';
+}
+
+async function runDiagnose() {
+  var btn = document.getElementById('mtDiag'), box = document.getElementById('mtReport');
+  setBusy(btn, true, 'Checking… (can take a minute)');
+  box.style.display = 'block'; box.textContent = 'Reading the sheet and timing each step…';
+  try {
+    var r = await api('diagnose');
+    box.textContent = r.report;
+  } catch (e) { box.textContent = e.message; }
+  finally { setBusy(btn, false, 'Run performance check'); }
+}
+
+async function runMaintenance(task, btn, title, text) {
+  if (!(await confirmDialog(title, text, 'Run now'))) return;
+  var label = btn.textContent;
+  setBusy(btn, true, 'Working…');
+  try {
+    var r = await api('maintenance', { task: task });
+    toast(r.message, 'success');
+    var box = document.getElementById('mtReport');
+    if (box) { box.style.display = 'block'; box.textContent = r.message; }
+  } catch (e) { toast(e.message, 'error'); }
+  finally { setBusy(btn, false, label); }
 }
 
 async function saveSettings() {

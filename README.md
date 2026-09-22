@@ -15,7 +15,7 @@ Live app: _add your link here_
 - Review the team's EOD logs by date and employee, and submit their own EOD log
 - Reports by employee and department, with CSV export
 - Add, deactivate and reactivate team members
-- Change statuses, priorities, departments and the EOD cutoff time from Settings
+- Change statuses, priorities, departments and the EOD cutoff time from Settings; run the performance check and maintenance jobs (archive, expire, fix dates) from the same page
 
 **For employees**
 
@@ -80,7 +80,8 @@ There is no separate server or SQL database. The front end is three static files
 |---|---|---|
 | `dailyScheduler` | Every day, 5am to 6am | Creates today's tickets from active recurring templates |
 | `markOverdueTickets` | Every hour | Marks late tickets as Overdue |
-| `archiveOldTickets` | Once a month (optional) | Moves Completed/Cancelled tickets older than `ARCHIVE_AFTER_DAYS` (default 120) to the **Tickets Archive** tab so the live tab stays small. Reports still include archived tickets |
+| `expireOverdueRecurring` | Daily (optional) | Marks recurring tickets still Overdue more than `EXPIRE_AFTER_DAYS` (default 14) after their due date as **Expired** so they stop piling up; Reports count them as missed |
+| `archiveOldTickets` | Weekly (recommended) | Moves Completed/Cancelled tickets older than `ARCHIVE_AFTER_DAYS` (default 60) to the **Tickets Archive** tab so the live tab stays small. Reports still include archived tickets |
 
 ## Updating the app
 
@@ -123,7 +124,7 @@ Ticket IDs look like `TKT-10001`, recurring templates `RT-1`, EOD logs `EOD-7000
 | Times look wrong | Set the Apps Script project time zone and deploy a new version |
 | Changes to `Code.gs` have no effect | Deploy a **New version** |
 | The dashboard looks unchanged after an update | Press Ctrl+F5 |
-| The dashboard is slow, or shows "The backend is busy" | The Tickets tab has grown large. Run `archiveOldTickets` once from the Apps Script editor (and add the monthly trigger). If it still happens at the same time every morning, several people are opening the app at once; it clears itself within a minute |
+| The dashboard is slow, or shows "The backend is busy" | Admin → Settings → **Run performance check**. The report says which button fixes it: *Archive old finished tickets* (large tab), *Expire stale recurring tickets* (thousands of overdue recurring tickets), or *Fix date formats* (date-typed cells) |
 | A change made directly in the Google Sheet does not show | Read results are cached for 2 minutes. Changes made through the app show immediately; edits made by hand in the sheet take up to 2 minutes |
 
 ## About
