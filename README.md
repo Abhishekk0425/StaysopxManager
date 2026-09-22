@@ -48,6 +48,14 @@ Google Sheet (the database)
 
 There is no separate server or SQL database. The front end is three static files that can be hosted anywhere. The Google Sheet ID never reaches the browser; the front end only knows the Apps Script web app URL.
 
+**Keeping it fast**
+
+- The dashboard is a single request. The reply carries only unfinished tickets and today's tickets (no descriptions), plus totals computed on the server.
+- Read results are cached on the server for up to 2 minutes and thrown away the moment anything is written through the app, so a whole team opening the dashboard at 9am reads the sheet once.
+- Ticket and EOD lists load the last 45 / 30 days by default, with a "Show older" link for everything else. Long lists are shown 150 rows at a time.
+- Opening a ticket, changing a status or adding a comment looks the row up directly instead of downloading the whole tab.
+- Coming back to the dashboard paints instantly from the last reply, then refreshes quietly in the background.
+
 ## Files
 
 | File | What it is |
@@ -72,12 +80,13 @@ There is no separate server or SQL database. The front end is three static files
 |---|---|---|
 | `dailyScheduler` | Every day, 5am to 6am | Creates today's tickets from active recurring templates |
 | `markOverdueTickets` | Every hour | Marks late tickets as Overdue |
+| `archiveOldTickets` | Once a month (optional) | Moves Completed/Cancelled tickets older than `ARCHIVE_AFTER_DAYS` (default 120) to the **Tickets Archive** tab so the live tab stays small. Reports still include archived tickets |
 
 ## Updating the app
 
 **Front end** (`index.html`, `script.js`, `style.css`): upload the new files to this repository with **Add file → Upload files** and commit. The site republishes in a minute or two. Press Ctrl+F5 in the browser to load the new version.
 
-**Backend** (`Code.gs`): paste the new code into the Apps Script editor, then **Deploy → Manage deployments → edit → New version → Deploy**. The URL stays the same. Without a new version, the change does not go live.
+**Backend** (`Code.gs`): paste the new code into the Apps Script editor, run `setupDatabase` once (it only adds anything that is missing, such as new settings or the archive tab), then **Deploy → Manage deployments → edit → New version → Deploy**. The URL stays the same. Without a new version, the change does not go live.
 
 If the new `Code.gs` uses a Google service the old one did not (the access code reset sends email, for example), run the function `authorizeEmail` once from the editor and accept the permission prompt before deploying the new version.
 
@@ -91,6 +100,7 @@ If the new `Code.gs` uses a Google service the old one did not (the access code 
 | Ticket Activity | The audit trail |
 | EOD Logs | One row per employee per day |
 | Settings | App configuration |
+| Tickets Archive | Old finished tickets moved out of the live tab by `archiveOldTickets` (created on first run) |
 
 Ticket IDs look like `TKT-10001`, recurring templates `RT-1`, EOD logs `EOD-70001`. Dates are stored as `yyyy-MM-dd` text and times as `HH:mm`, so they never shift with time zones.
 
@@ -113,6 +123,8 @@ Ticket IDs look like `TKT-10001`, recurring templates `RT-1`, EOD logs `EOD-7000
 | Times look wrong | Set the Apps Script project time zone and deploy a new version |
 | Changes to `Code.gs` have no effect | Deploy a **New version** |
 | The dashboard looks unchanged after an update | Press Ctrl+F5 |
+| The dashboard is slow, or shows "The backend is busy" | The Tickets tab has grown large. Run `archiveOldTickets` once from the Apps Script editor (and add the monthly trigger). If it still happens at the same time every morning, several people are opening the app at once; it clears itself within a minute |
+| A change made directly in the Google Sheet does not show | Read results are cached for 2 minutes. Changes made through the app show immediately; edits made by hand in the sheet take up to 2 minutes |
 
 ## About
 

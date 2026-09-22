@@ -2,13 +2,29 @@
  * Stayopx Manager — Ticketing & Daily Work Log System
  * Google Apps Script backend (API layer over Google Sheets)
  *
+ * v2 — PERFORMANCE RELEASE. What changed and why:
+ *  • dashboard()          one request returns everything the dashboard needs (was 3–4 parallel requests,
+ *                         each re-reading the whole Tickets sheet). Only unfinished + today's tickets are sent.
+ *  • response cache       read results are cached for CACHE_SECONDS and thrown away the moment anything is
+ *                         written, so a team opening the app at the same time hits the sheet once, not 20 times.
+ *  • indexed lookups      finding one ticket / one ticket's activity uses the sheet's own text search instead
+ *                         of downloading the whole tab (status clicks, comments and ticket modals are ~10x faster).
+ *  • batched triggers     markOverdueTickets / dailyScheduler write in a handful of calls instead of 5 per ticket.
+ *  • windowed lists       ticket / EOD lists return the last N days by default; the app can still ask for all.
+ *  • archiveOldTickets    optional monthly job that moves old finished tickets to an archive tab so the live
+ *                         tab stays small forever (Reports still include the archive).
+ *
  * SETUP (see SETUP.md):
  *  1. Create a blank Google Spreadsheet, open Extensions → Apps Script, paste this file.
  *  2. Run setupDatabase() once (authorize when prompted). It creates all tabs + a default admin.
  *  3. Deploy → New deployment → Web app → Execute as: Me, Access: Anyone. Copy the /exec URL.
  *  4. Paste the URL into CONFIG.API_URL at the top of script.js.
- *  5. Add time-driven triggers for dailyScheduler (daily, early morning) and markOverdueTickets (hourly).
+ *  5. Add time-driven triggers: dailyScheduler (daily, 5–6 AM), markOverdueTickets (hourly),
+ *     and optionally archiveOldTickets (monthly).
  *  6. Run authorizeEmail() once so the "Forgot access code?" emails can be sent.
+ *
+ * UPGRADING from v1: paste this file over the old one, run setupDatabase() once more (it only adds what is
+ * missing), then Deploy → Manage deployments → edit → New version → Deploy.
  */
 
 var DB = {
@@ -17,7 +33,8 @@ var DB = {
   RECURRING: 'Recurring Tickets',
   ACTIVITY: 'Ticket Activity',
   EOD: 'EOD Logs',
-  SETTINGS: 'Settings'
+  SETTINGS: 'Settings',
+  ARCHIVE: 'Tickets Archive'
 };
 
 var HEADERS = {};
@@ -27,18 +44,39 @@ HEADERS[DB.RECURRING] = ['Recurring ID','Title','Description','Assigned To','Fre
 HEADERS[DB.ACTIVITY] = ['Activity ID','Ticket ID','User','Previous Status','New Status','Comment','Date','Time'];
 HEADERS[DB.EOD] = ['Log ID','Employee ID','Employee Name','Date','Tickets Assigned','Tickets Completed','Tickets Pending','Work Completed','Challenges','Pending Work','Tomorrow Plan','Remarks','Submitted At'];
 HEADERS[DB.SETTINGS] = ['Key','Value','Description'];
+HEADERS[DB.ARCHIVE] = HEADERS[DB.TICKETS];
 
 var TZ = Session.getScriptTimeZone();
 
+/* How long a read result may be served from cache. Any write through the app clears it immediately,
+ * so this only limits how long a change made DIRECTLY in the Google Sheet takes to show up. */
+var CACHE_SECONDS = 120;
+
+/* Statuses that mean "still to be done" */
+var ACTIVE = { 'Open': 1, 'In Progress': 1, 'On Hold': 1, 'Overdue': 1 };
+
+/* Long text in ticket LISTS is trimmed to this many characters; the ticket modal always loads the full text */
+var LIST_DESC_CHARS = 240;
+
+var DEFAULT_SETTINGS = [
+  ['EOD_CUTOFF', '23:00', 'Employees can edit their EOD log until this time (HH:mm, 24h)'],
+  ['STATUSES', 'Open,In Progress,Completed,On Hold,Overdue', 'Ticket statuses'],
+  ['PRIORITIES', 'Low,Medium,High,Critical', 'Ticket priorities'],
+  ['DEPARTMENTS', 'Operations,Housekeeping,F&B,Maintenance,Finance,Sales,Tech', 'Departments'],
+  ['FREQUENCIES', 'One-Time,Daily,Weekly,Monthly', 'Ticket types'],
+  ['APP_NAME', 'Stayopx Manager', 'Application display name'],
+  ['ARCHIVE_AFTER_DAYS', '120', 'archiveOldTickets moves Completed/Cancelled tickets older than this many days to the archive tab']
+];
+
 /* ============================================================
- * ONE-TIME SETUP
+ * ONE-TIME SETUP (safe to run again — it only adds what is missing)
  * ============================================================ */
 function setupDatabase() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var s = ss();
   Object.keys(DB).forEach(function(k) {
     var name = DB[k];
-    var sh = ss.getSheetByName(name);
-    if (!sh) sh = ss.insertSheet(name);
+    var sh = s.getSheetByName(name);
+    if (!sh) sh = s.insertSheet(name);
     if (sh.getLastRow() === 0) {
       sh.appendRow(HEADERS[name]);
       sh.getRange(1, 1, 1, HEADERS[name].length).setFontWeight('bold').setBackground('#EEF1F4');
@@ -46,30 +84,30 @@ function setupDatabase() {
     }
   });
   // Force date-sensitive columns to plain text so values round-trip as strings
-  var tk = ss.getSheetByName(DB.TICKETS);
-  tk.getRange('J:L').setNumberFormat('@'); tk.getRange('N:P').setNumberFormat('@');
-  ss.getSheetByName(DB.ACTIVITY).getRange('G:H').setNumberFormat('@');
-  ss.getSheetByName(DB.EOD).getRange('D:D').setNumberFormat('@');
-  ss.getSheetByName(DB.EOD).getRange('M:M').setNumberFormat('@');
-  ss.getSheetByName(DB.RECURRING).getRange('G:I').setNumberFormat('@');
-  ss.getSheetByName(DB.USERS).getRange('G:H').setNumberFormat('@');
+  [DB.TICKETS, DB.ARCHIVE].forEach(function(n) {
+    var tk = s.getSheetByName(n);
+    tk.getRange('J:L').setNumberFormat('@'); tk.getRange('N:P').setNumberFormat('@');
+  });
+  s.getSheetByName(DB.ACTIVITY).getRange('G:H').setNumberFormat('@');
+  s.getSheetByName(DB.EOD).getRange('D:D').setNumberFormat('@');
+  s.getSheetByName(DB.EOD).getRange('M:M').setNumberFormat('@');
+  s.getSheetByName(DB.RECURRING).getRange('G:I').setNumberFormat('@');
+  s.getSheetByName(DB.USERS).getRange('G:H').setNumberFormat('@');
 
-  var settings = ss.getSheetByName(DB.SETTINGS);
-  if (settings.getLastRow() < 2) {
-    var rows = [
-      ['EOD_CUTOFF', '23:00', 'Employees can edit their EOD log until this time (HH:mm, 24h)'],
-      ['STATUSES', 'Open,In Progress,Completed,On Hold,Overdue', 'Ticket statuses'],
-      ['PRIORITIES', 'Low,Medium,High,Critical', 'Ticket priorities'],
-      ['DEPARTMENTS', 'Operations,Housekeeping,F&B,Maintenance,Finance,Sales,Tech', 'Departments'],
-      ['FREQUENCIES', 'One-Time,Daily,Weekly,Monthly', 'Ticket types'],
-      ['APP_NAME', 'Stayopx Manager', 'Application display name']
-    ];
-    settings.getRange(2, 1, rows.length, 3).setValues(rows);
+  // Settings: add any key that is not there yet, keep existing values
+  var have = {};
+  rows(DB.SETTINGS).forEach(function(r) { have[r['Key']] = true; });
+  var missing = DEFAULT_SETTINGS.filter(function(r) { return !have[r[0]]; });
+  if (missing.length) {
+    var st = s.getSheetByName(DB.SETTINGS);
+    st.getRange(st.getLastRow() + 1, 1, missing.length, 3).setValues(missing);
   }
-  var users = ss.getSheetByName(DB.USERS);
+
+  var users = s.getSheetByName(DB.USERS);
   if (users.getLastRow() < 2) {
     users.appendRow(['USR-1001', 'Admin', 'admin@company.com', 'Admin', 'Operations', 'Active', today(), 'admin123']);
   }
+  bumpVersion();
   return 'Database ready';
 }
 
@@ -82,6 +120,7 @@ function doGet() {
 
 function doPost(e) {
   try {
+    if (!e || !e.postData || !e.postData.contents) return json({ ok: false, error: 'BAD_REQUEST', message: 'Empty request.' });
     var req = JSON.parse(e.postData.contents);
     var action = req.action;
     var p = req.payload || {};
@@ -104,6 +143,7 @@ function doPost(e) {
       case 'requestReset':     out = requestReset(p); break;
       case 'resetPassword':    out = resetPassword(p); break;
       case 'bootstrap':        out = bootstrap(user); break;
+      case 'dashboard':        out = dashboard(user); break;
       case 'listTickets':      out = listTickets(user, p); break;
       case 'getTicket':        out = getTicket(user, p); break;
       case 'createTicket':     out = createTicket(user, p); break;
@@ -136,7 +176,8 @@ function friendlyError(err) {
   var m = String(err && err.message || err);
   // Known, user-safe messages start with "!"
   if (m.indexOf('!') === 0) return m.substring(1);
-  console.error(m);
+  console.error(m + (err && err.stack ? '\n' + err.stack : ''));
+  if (/lock/i.test(m)) return 'The system is busy right now. Please try again in a few seconds.';
   return 'Something went wrong. Please try again.';
 }
 
@@ -151,32 +192,36 @@ function login(p) {
   var email = String(p.email || '').trim().toLowerCase();
   var code = String(p.code || '').trim();
   if (!email || !code) throw new Error('!Enter your email and access code.');
-  var u = rows(DB.USERS).filter(function(r) {
-    return String(r['Email']).trim().toLowerCase() === email;
-  })[0];
+  var u = findUserByEmail(email);
   if (!u || String(u['Access Code']).trim() !== code) throw new Error('!Invalid email or access code.');
   if (String(u['Status']) !== 'Active') throw new Error('!This account is inactive. Contact your admin.');
 
   var user = { id: u['User ID'], name: u['Name'], email: u['Email'], role: u['Role'], department: u['Department'] };
   var token = Utilities.getUuid();
-  CacheService.getScriptCache().put('tok_' + token, JSON.stringify(user), 21600); // 6 hours
+  user._t = Date.now();
+  cache().put('tok_' + token, JSON.stringify(user), 21600); // 6 hours
+  delete user._t;
   return { token: token, user: user, settings: settingsMap() };
 }
 
+/* Sliding 6-hour session. The expiry is pushed forward at most once every 30 minutes,
+ * so validating a token is normally a single cache read. */
 function validateToken(token) {
   if (!token) return null;
-  var raw = CacheService.getScriptCache().get('tok_' + token);
+  var c = cache();
+  var raw = c.get('tok_' + token);
   if (!raw) return null;
-  CacheService.getScriptCache().put('tok_' + token, raw, 21600); // sliding expiry
-  return JSON.parse(raw);
+  var user = JSON.parse(raw);
+  if (!user._t || Date.now() - user._t > 30 * 60 * 1000) {
+    user._t = Date.now();
+    c.put('tok_' + token, JSON.stringify(user), 21600);
+  }
+  delete user._t;
+  return user;
 }
 
 /* ------------------------------------------------------------
  * FORGOT ACCESS CODE — emailed 6-digit code
- *   requestReset  : emails a one-time code to the address on file
- *   resetPassword : checks the code and saves the new access code
- * The code lives in the script cache only (never in the sheet), is valid for
- * 10 minutes, and is thrown away after 5 wrong tries.
  * ------------------------------------------------------------ */
 var RESET_MINUTES = 10;
 var RESET_MAX_TRIES = 5;
@@ -192,9 +237,9 @@ function requestReset(p) {
   var email = String(p.email || '').trim().toLowerCase();
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new Error('!Enter your work email.');
 
-  var cache = CacheService.getScriptCache();
-  if (cache.get('rst_wait_' + email)) throw new Error('!A code was just sent. Wait a minute before asking for another.');
-  cache.put('rst_wait_' + email, '1', 60);
+  var c = cache();
+  if (c.get('rst_wait_' + email)) throw new Error('!A code was just sent. Wait a minute before asking for another.');
+  c.put('rst_wait_' + email, '1', 60);
 
   // Same reply whether or not the email is registered, so this screen can't be used to find out who has an account.
   var reply = { sent: true, minutes: RESET_MINUTES };
@@ -202,7 +247,7 @@ function requestReset(p) {
   if (!u || String(u['Status']) !== 'Active') return reply;
 
   var otp = ('000000' + (parseInt(Utilities.getUuid().replace(/-/g, '').slice(0, 8), 16) % 1000000)).slice(-6);
-  cache.put('rst_' + email, JSON.stringify({ otp: otp, tries: 0, exp: Date.now() + RESET_MINUTES * 60000 }), RESET_MINUTES * 60);
+  c.put('rst_' + email, JSON.stringify({ otp: otp, tries: 0, exp: Date.now() + RESET_MINUTES * 60000 }), RESET_MINUTES * 60);
 
   var app = settingsMap()['APP_NAME'] || 'Stayopx Manager';
   try {
@@ -221,7 +266,7 @@ function requestReset(p) {
     });
   } catch (err) {
     console.error('Reset email failed: ' + err);
-    cache.remove('rst_' + email);
+    c.remove('rst_' + email);
     throw new Error('!We could not send the email right now. Ask your admin to set a new access code for you.');
   }
   return reply;
@@ -235,30 +280,26 @@ function resetPassword(p) {
   if (newCode.length < RESET_MIN_LENGTH) throw new Error('!Your new access code must be at least ' + RESET_MIN_LENGTH + ' characters.');
 
   var wrong = '!That code is wrong or has expired. Ask for a new one.';
-  var lock = LockService.getScriptLock();
-  lock.waitLock(10000);
-  try {
-    var cache = CacheService.getScriptCache();
-    var raw = cache.get('rst_' + email);
+  return withLock(10000, function() {
+    var c = cache();
+    var raw = c.get('rst_' + email);
     if (!raw) throw new Error(wrong);
     var rec = JSON.parse(raw);
-    if (Date.now() > rec.exp) { cache.remove('rst_' + email); throw new Error(wrong); }
+    if (Date.now() > rec.exp) { c.remove('rst_' + email); throw new Error(wrong); }
 
     if (rec.otp !== otp) {
       rec.tries++;
-      if (rec.tries >= RESET_MAX_TRIES) cache.remove('rst_' + email);
-      else cache.put('rst_' + email, JSON.stringify(rec), Math.max(1, Math.ceil((rec.exp - Date.now()) / 1000)));
+      if (rec.tries >= RESET_MAX_TRIES) c.remove('rst_' + email);
+      else c.put('rst_' + email, JSON.stringify(rec), Math.max(1, Math.ceil((rec.exp - Date.now()) / 1000)));
       throw new Error(wrong);
     }
 
     var u = findUserByEmail(email);
-    if (!u || String(u['Status']) !== 'Active') { cache.remove('rst_' + email); throw new Error(wrong); }
+    if (!u || String(u['Status']) !== 'Active') { c.remove('rst_' + email); throw new Error(wrong); }
     updateRowObj(DB.USERS, u._row, { 'Access Code': newCode });
-    cache.remove('rst_' + email);
+    c.remove('rst_' + email);
     return { done: true };
-  } finally {
-    lock.releaseLock();
-  }
+  });
 }
 
 function htmlEsc(s) {
@@ -284,19 +325,48 @@ function bootstrap(user) {
 /* ============================================================
  * SHEET HELPERS
  * ============================================================ */
-function sheet(name) { return SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name); }
+var _ss = null;
+function ss() { return _ss || (_ss = SpreadsheetApp.getActiveSpreadsheet()); }
+function sheet(name) { return ss().getSheetByName(name); }
+
+/* Each tab is read at most once per request; writes clear the copy so the next read is fresh. */
+var _memo = {};
+function forget(name) { delete _memo[name]; }
 
 function rows(name) {
+  if (_memo[name]) return _memo[name];
+  var sh = sheet(name);
+  var out = [];
+  if (sh) {
+    var last = sh.getLastRow();
+    if (last >= 2) {
+      var head = HEADERS[name];
+      out = toObjects(name, sh.getRange(2, 1, last - 1, head.length).getValues(), 2);
+    }
+  }
+  _memo[name] = out;
+  return out;
+}
+
+/* The last `count` data rows of a tab. Used for append-mostly tabs (EOD logs) where today's rows are always at the bottom. */
+function rowsTail(name, count) {
   var sh = sheet(name);
   var last = sh.getLastRow();
   if (last < 2) return [];
-  var head = HEADERS[name];
-  var data = sh.getRange(2, 1, last - 1, head.length).getValues();
-  return data.map(function(r, i) {
-    var o = { _row: i + 2 };
-    head.forEach(function(h, c) { o[h] = normalize(r[c]); });
-    return o;
-  }).filter(function(o) { return o[head[0]] !== ''; });
+  var start = Math.max(2, last - count + 1);
+  return toObjects(name, sh.getRange(start, 1, last - start + 1, HEADERS[name].length).getValues(), start);
+}
+
+function toObjects(name, data, firstRow) {
+  var head = HEADERS[name], n = head.length, out = [];
+  for (var i = 0; i < data.length; i++) {
+    var r = data[i];
+    if (r[0] === '' || r[0] === null || r[0] === undefined) continue;
+    var o = { _row: firstRow + i };
+    for (var c = 0; c < n; c++) o[head[c]] = normalize(r[c]);
+    out.push(o);
+  }
+  return out;
 }
 
 function normalize(v) {
@@ -304,30 +374,101 @@ function normalize(v) {
   return v === null || v === undefined ? '' : String(v);
 }
 
-function appendRowObj(name, obj) {
-  var head = HEADERS[name];
-  sheet(name).appendRow(head.map(function(h) { return obj[h] !== undefined ? obj[h] : ''; }));
-}
-
-function updateRowObj(name, rowIndex, patch) {
-  var head = HEADERS[name];
-  var sh = sheet(name);
-  var current = sh.getRange(rowIndex, 1, 1, head.length).getValues()[0];
-  head.forEach(function(h, c) { if (patch[h] !== undefined) current[c] = patch[h]; });
-  sh.getRange(rowIndex, 1, 1, head.length).setValues([current]);
-}
-
-function nextId(prefix, key, start) {
-  var lock = LockService.getScriptLock();
-  lock.waitLock(10000);
+/* Find the rows of one tab where `header` equals `value`, using the sheet's own text search
+ * instead of downloading the whole tab. Falls back to a full scan if the search is unavailable. */
+function findRowsByKey(name, header, value) {
+  var sh = sheet(name), head = HEADERS[name];
+  var col = head.indexOf(header) + 1;
+  var last = sh.getLastRow();
+  if (last < 2 || !value) return [];
+  var found = null;
   try {
-    var props = PropertiesService.getScriptProperties();
-    var n = Number(props.getProperty(key) || start);
-    props.setProperty(key, String(n + 1));
-    return prefix + n;
-  } finally {
-    lock.releaseLock();
+    found = sh.getRange(2, col, last - 1, 1).createTextFinder(String(value)).matchEntireCell(true).matchCase(true).findAll();
+  } catch (e) { found = null; }
+  if (!found) return rows(name).filter(function(r) { return r[header] === value; });
+  if (!found.length) return [];
+
+  var rowNums = found.map(function(r) { return r.getRow(); }).sort(function(a, b) { return a - b; });
+  var out = [];
+  // read nearby hits in one block instead of one call per row
+  var i = 0;
+  while (i < rowNums.length) {
+    var j = i;
+    while (j + 1 < rowNums.length && rowNums[j + 1] - rowNums[i] <= 400) j++;
+    var start = rowNums[i], stop = rowNums[j];
+    var block = toObjects(name, sh.getRange(start, 1, stop - start + 1, head.length).getValues(), start);
+    for (var k = 0; k < block.length; k++) if (block[k][header] === String(value)) out.push(block[k]);
+    i = j + 1;
   }
+  return out;
+}
+
+/* ---------- writes (all serialised through the script lock, and every write clears the read cache) ---------- */
+var _lockDepth = 0;
+function withLock(ms, fn) {
+  if (_lockDepth > 0) return fn();                    // already held by this execution
+  var lock = LockService.getScriptLock();
+  try { lock.waitLock(ms || 10000); }
+  catch (e) { throw new Error('!The system is busy right now. Please try again in a few seconds.'); }
+  _lockDepth = 1;
+  try { return fn(); } finally { _lockDepth = 0; lock.releaseLock(); }
+}
+
+function rowArray(name, obj) {
+  return HEADERS[name].map(function(h) { return obj[h] !== undefined ? obj[h] : ''; });
+}
+
+function appendRowObj(name, obj) {
+  var row = rowArray(name, obj);
+  withLock(10000, function() { sheet(name).appendRow(row); });
+  forget(name); bumpVersion();
+}
+
+function appendRowsObj(name, objs) {
+  if (!objs || !objs.length) return;
+  var data = objs.map(function(o) { return rowArray(name, o); });
+  withLock(30000, function() {
+    var sh = sheet(name);
+    sh.getRange(sh.getLastRow() + 1, 1, data.length, data[0].length).setValues(data);
+  });
+  forget(name); bumpVersion();
+}
+
+/* Writes only the cells named in `patch` (grouped into as few calls as possible) — nothing else in the row is touched. */
+function updateRowObj(name, rowIndex, patch) {
+  var head = HEADERS[name], sh = sheet(name);
+  var cols = [];
+  head.forEach(function(h, c) { if (patch[h] !== undefined) cols.push(c); });
+  if (!cols.length) return;
+  withLock(10000, function() {
+    var i = 0;
+    while (i < cols.length) {
+      var j = i;
+      while (j + 1 < cols.length && cols[j + 1] === cols[j] + 1) j++;
+      var vals = cols.slice(i, j + 1).map(function(c) { return patch[head[c]]; });
+      sh.getRange(rowIndex, cols[i] + 1, 1, vals.length).setValues([vals]);
+      i = j + 1;
+    }
+  });
+  forget(name); bumpVersion();
+}
+
+function nextIds(prefix, key, start, n) {
+  return withLock(10000, function() {
+    var props = PropertiesService.getScriptProperties();
+    var cur = Number(props.getProperty(key) || start);
+    props.setProperty(key, String(cur + n));
+    var out = [];
+    for (var i = 0; i < n; i++) out.push(prefix + (cur + i));
+    return out;
+  });
+}
+function nextId(prefix, key, start) { return nextIds(prefix, key, start, 1)[0]; }
+
+function colLetter(col) {
+  var s = '';
+  while (col > 0) { var m = (col - 1) % 26; s = String.fromCharCode(65 + m) + s; col = (col - m - 1) / 26; }
+  return s;
 }
 
 function settingsMap() {
@@ -339,13 +480,58 @@ function settingsMap() {
 function today() { return Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd'); }
 function nowTime() { return Utilities.formatDate(new Date(), TZ, 'HH:mm'); }
 function nowStamp() { return today() + ' ' + Utilities.formatDate(new Date(), TZ, 'HH:mm:ss'); }
+function dateMinus(days) {
+  var d = new Date(); d.setDate(d.getDate() - days);
+  return Utilities.formatDate(d, TZ, 'yyyy-MM-dd');
+}
+function parseDate(s) {
+  var p = String(s).split('-');
+  return new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2] || 1));
+}
+
+/* ============================================================
+ * RESPONSE CACHE
+ * Read results are cached (gzipped) in the script cache. `data_ver` changes on every write,
+ * and it is part of every cache key, so a write makes all cached reads obsolete instantly.
+ * ============================================================ */
+function cache() { return CacheService.getScriptCache(); }
+function dataVersion() { return cache().get('data_ver') || '0'; }
+function bumpVersion() { try { cache().put('data_ver', String(Date.now()), 21600); } catch (e) {} }
+
+function cacheGetObj(key) {
+  var raw = cache().get(key);
+  if (!raw) return null;
+  try {
+    var bytes = Utilities.base64Decode(raw);
+    var text = Utilities.ungzip(Utilities.newBlob(bytes, 'application/x-gzip')).getDataAsString();
+    return JSON.parse(text);
+  } catch (e) { return null; }
+}
+function cachePutObj(key, obj, seconds) {
+  try {
+    var gz = Utilities.gzip(Utilities.newBlob(JSON.stringify(obj), 'application/json'));
+    var b64 = Utilities.base64Encode(gz.getBytes());
+    if (b64.length > 95000) return false;             // the cache holds at most 100 KB per key
+    cache().put(key, b64, seconds);
+    return true;
+  } catch (e) { return false; }
+}
+function cached(key, fn) {
+  var full = key + '|' + dataVersion();
+  if (full.length > 240) return fn();                  // key too long to cache — just compute
+  var hit = cacheGetObj(full);
+  if (hit && hit.v !== undefined) return hit.v;
+  var v = fn();
+  cachePutObj(full, { v: v }, CACHE_SECONDS);
+  return v;
+}
 
 /* ============================================================
  * ACTIVITY LOG
  * ============================================================ */
-function logActivity(ticketId, userName, prevStatus, newStatus, comment) {
-  appendRowObj(DB.ACTIVITY, {
-    'Activity ID': nextId('ACT-', 'seq_activity', 50001),
+function activityRow(id, ticketId, userName, prevStatus, newStatus, comment) {
+  return {
+    'Activity ID': id,
     'Ticket ID': ticketId,
     'User': userName,
     'Previous Status': prevStatus || '',
@@ -353,7 +539,10 @@ function logActivity(ticketId, userName, prevStatus, newStatus, comment) {
     'Comment': comment || '',
     'Date': today(),
     'Time': Utilities.formatDate(new Date(), TZ, 'HH:mm:ss')
-  });
+  };
+}
+function logActivity(ticketId, userName, prevStatus, newStatus, comment) {
+  appendRowObj(DB.ACTIVITY, activityRow(nextId('ACT-', 'seq_activity', 50001), ticketId, userName, prevStatus, newStatus, comment));
 }
 
 /* ============================================================
@@ -365,30 +554,63 @@ function scopeTickets(user) {
   return all.filter(function(t) { return t['Assigned To'] === user.id; });
 }
 
-function listTickets(user, p) {
-  var list = scopeTickets(user);
-  if (p && p.status) list = list.filter(function(t) { return t['Status'] === p.status; });
-  list.sort(function(a, b) {
-    return (b['Scheduled Date'] + b['Scheduled Time']).localeCompare(a['Scheduled Date'] + a['Scheduled Time']);
-  });
-  return list.map(publicTicket);
+function bySchedule(a, b) {
+  return (b['Scheduled Date'] + b['Scheduled Time']).localeCompare(a['Scheduled Date'] + a['Scheduled Time']);
 }
 
+/* Ticket as sent in lists: full text is trimmed (the modal loads the full ticket) */
+function listTicket(t) {
+  var o = publicTicket(t);
+  if (o['Description'] && o['Description'].length > LIST_DESC_CHARS) o['Description'] = o['Description'].slice(0, LIST_DESC_CHARS) + '…';
+  return o;
+}
+/* Ticket as sent to the dashboard: no description at all */
+function slimTicket(t) {
+  var o = publicTicket(t);
+  delete o['Description'];
+  return o;
+}
 function publicTicket(t) {
   var o = {};
   HEADERS[DB.TICKETS].forEach(function(h) { o[h] = t[h]; });
   return o;
 }
 
+/**
+ * Ticket list. Options:
+ *   status, employee (admin), date  — exact filters
+ *   days   — only tickets scheduled in the last N days (or later), PLUS every unfinished ticket
+ *   all    — everything (ignores days)
+ * With no options the full list is returned, as before.
+ */
+function listTickets(user, p) {
+  p = p || {};
+  var isAdmin = user.role === 'Admin';
+  var key = 'tk|' + (isAdmin ? 'admin' : user.id) + '|' + today() + '|' +
+    JSON.stringify({ s: p.status || '', e: p.employee || '', d: p.date || '', n: Number(p.days) || 0, a: !!p.all });
+  return cached(key, function() {
+    var list = scopeTickets(user);
+    if (p.status) list = list.filter(function(t) { return t['Status'] === p.status; });
+    if (p.employee && isAdmin) list = list.filter(function(t) { return t['Assigned To'] === p.employee; });
+    if (p.date) list = list.filter(function(t) { return t['Scheduled Date'] === p.date; });
+    if (!p.all && !p.date && Number(p.days) > 0) {
+      var from = dateMinus(Number(p.days));
+      list = list.filter(function(t) { return t['Scheduled Date'] >= from || ACTIVE[t['Status']]; });
+    }
+    list.sort(bySchedule);
+    return list.map(listTicket);
+  });
+}
+
 function getTicket(user, p) {
   var t = findTicket(p.id);
   if (user.role !== 'Admin' && t['Assigned To'] !== user.id) throw new Error('!You do not have access to this ticket.');
-  var activity = rows(DB.ACTIVITY).filter(function(a) { return a['Ticket ID'] === p.id; });
+  var activity = findRowsByKey(DB.ACTIVITY, 'Ticket ID', p.id).map(cleanRow(DB.ACTIVITY));
   return { ticket: publicTicket(t), activity: activity };
 }
 
 function findTicket(id) {
-  var t = rows(DB.TICKETS).filter(function(r) { return r['Ticket ID'] === id; })[0];
+  var t = findRowsByKey(DB.TICKETS, 'Ticket ID', id)[0];
   if (!t) throw new Error('!Ticket not found.');
   return t;
 }
@@ -412,27 +634,29 @@ function createTicket(user, p) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(p.scheduledDate))) throw new Error('!Pick a valid scheduled date.');
   if (p.dueDate && String(p.dueDate) < String(p.scheduledDate)) throw new Error('!The due date cannot be before the scheduled date.');
   if (String(p.title).length > 200) throw new Error('!Keep the title under 200 characters.');
-  var id = nextId('TKT-', 'seq_ticket', 10001);
-  appendRowObj(DB.TICKETS, {
-    'Ticket ID': id,
-    'Parent Ticket ID': p.parentId || '',
-    'Title': p.title,
-    'Description': p.description || '',
-    'Assigned To': p.assignedTo,
-    'Created By': user.id,
-    'Department': p.department || '',
-    'Priority': p.priority,
-    'Ticket Type': p.ticketType || 'One-Time',
-    'Scheduled Date': p.scheduledDate,
-    'Scheduled Time': p.scheduledTime || '',
-    'Due Date': p.dueDate || p.scheduledDate,
-    'Status': 'Open',
-    'Created Date': nowStamp(),
-    'Updated Date': nowStamp(),
-    'Completed Date': ''
+  return withLock(10000, function() {
+    var id = nextId('TKT-', 'seq_ticket', 10001);
+    appendRowObj(DB.TICKETS, {
+      'Ticket ID': id,
+      'Parent Ticket ID': p.parentId || '',
+      'Title': p.title,
+      'Description': p.description || '',
+      'Assigned To': p.assignedTo,
+      'Created By': user.id,
+      'Department': p.department || '',
+      'Priority': p.priority,
+      'Ticket Type': p.ticketType || 'One-Time',
+      'Scheduled Date': p.scheduledDate,
+      'Scheduled Time': p.scheduledTime || '',
+      'Due Date': p.dueDate || p.scheduledDate,
+      'Status': 'Open',
+      'Created Date': nowStamp(),
+      'Updated Date': nowStamp(),
+      'Completed Date': ''
+    });
+    logActivity(id, user.name, '', 'Open', (p.assignedTo === user.id ? 'Self-created by ' : 'Ticket created by ') + user.name);
+    return { id: id };
   });
-  logActivity(id, user.name, '', 'Open', (p.assignedTo === user.id ? 'Self-created by ' : 'Ticket created by ') + user.name);
-  return { id: id };
 }
 
 function updateTicket(user, p) {
@@ -452,7 +676,7 @@ function updateStatus(user, p) {
   requireFields(p, ['id', 'status']);
   var t = findTicket(p.id);
   if (user.role !== 'Admin' && t['Assigned To'] !== user.id) throw new Error('!You can only update your own tickets.');
-  var valid = settingsMap()['STATUSES'].split(',');
+  var valid = String(settingsMap()['STATUSES'] || 'Open,In Progress,Completed,On Hold,Overdue').split(',');
   if (valid.indexOf(p.status) === -1) throw new Error('!Invalid status.');
   var patch = { 'Status': p.status, 'Updated Date': nowStamp() };
   if (p.status === 'Completed') patch['Completed Date'] = nowStamp();
@@ -512,11 +736,11 @@ function createRecurring(user, p) {
 }
 
 function listRecurring() {
-  return rows(DB.RECURRING).map(function(r) { var o = {}; HEADERS[DB.RECURRING].forEach(function(h) { o[h] = r[h]; }); return o; });
+  return rows(DB.RECURRING).map(cleanRow(DB.RECURRING));
 }
 
 function updateRecurring(user, p) {
-  var r = rows(DB.RECURRING).filter(function(x) { return x['Recurring ID'] === p.id; })[0];
+  var r = findRowsByKey(DB.RECURRING, 'Recurring ID', p.id)[0];
   if (!r) throw new Error('!Recurring ticket not found.');
   var patch = {};
   if (p.status) patch['Status'] = p.status; // Active / Paused
@@ -537,9 +761,7 @@ function dailyScheduler() {
 }
 
 function generateForDate(dateStr) {
-  var lock = LockService.getScriptLock();
-  lock.waitLock(30000);
-  try {
+  return withLock(30000, function() {
     var d = parseDate(dateStr);
     var weekday = Utilities.formatDate(d, TZ, 'EEEE'); // Monday...
     var dom = d.getDate();
@@ -547,29 +769,28 @@ function generateForDate(dateStr) {
 
     var existing = {};
     rows(DB.TICKETS).forEach(function(t) {
-      if (t['Parent Ticket ID']) existing[t['Parent Ticket ID'] + '|' + t['Scheduled Date']] = true;
+      if (t['Parent Ticket ID'] && t['Scheduled Date'] === dateStr) existing[t['Parent Ticket ID']] = true;
     });
 
-    var users = rows(DB.USERS);
-    var created = 0;
-    rows(DB.RECURRING).forEach(function(r) {
-      if (r['Status'] !== 'Active') return;
-      if (r['Start Date'] && dateStr < r['Start Date']) return;
-      if (r['End Date'] && dateStr > r['End Date']) return;
+    var due = rows(DB.RECURRING).filter(function(r) {
+      if (r['Status'] !== 'Active') return false;
+      if (r['Start Date'] && dateStr < r['Start Date']) return false;
+      if (r['End Date'] && dateStr > r['End Date']) return false;
+      if (existing[r['Recurring ID']]) return false;        // duplicate prevention
+      if (r['Frequency'] === 'Daily') return true;
+      if (r['Frequency'] === 'Weekly') return r['Day'] === weekday;
+      if (r['Frequency'] === 'Monthly') return dom === Math.min(Number(r['Day']) || 1, lastDom); // clamp e.g. 31st in Feb
+      return false;
+    });
+    if (!due.length) return 0;
 
-      var due = false;
-      if (r['Frequency'] === 'Daily') due = true;
-      else if (r['Frequency'] === 'Weekly') due = (r['Day'] === weekday);
-      else if (r['Frequency'] === 'Monthly') {
-        var target = Math.min(Number(r['Day']) || 1, lastDom); // clamp e.g. 31st in Feb
-        due = (dom === target);
-      }
-      if (!due) return;
-      if (existing[r['Recurring ID'] + '|' + dateStr]) return; // duplicate prevention
-
-      var id = nextId('TKT-', 'seq_ticket', 10001);
-      appendRowObj(DB.TICKETS, {
-        'Ticket ID': id,
+    var ids = nextIds('TKT-', 'seq_ticket', 10001, due.length);
+    var actIds = nextIds('ACT-', 'seq_activity', 50001, due.length);
+    var stamp = nowStamp();
+    var tickets = [], acts = [];
+    due.forEach(function(r, i) {
+      tickets.push({
+        'Ticket ID': ids[i],
         'Parent Ticket ID': r['Recurring ID'],
         'Title': r['Title'],
         'Description': r['Description'],
@@ -582,51 +803,132 @@ function generateForDate(dateStr) {
         'Scheduled Time': r['Time'],
         'Due Date': dateStr,
         'Status': 'Open',
-        'Created Date': nowStamp(),
-        'Updated Date': nowStamp(),
+        'Created Date': stamp,
+        'Updated Date': stamp,
         'Completed Date': ''
       });
-      logActivity(id, 'Scheduler', '', 'Open', 'Auto-generated from recurring template ' + r['Recurring ID']);
-      created++;
+      acts.push(activityRow(actIds[i], ids[i], 'Scheduler', '', 'Open', 'Auto-generated from recurring template ' + r['Recurring ID']));
     });
-    return created;
-  } finally {
-    lock.releaseLock();
-  }
+    appendRowsObj(DB.TICKETS, tickets);
+    appendRowsObj(DB.ACTIVITY, acts);
+    return due.length;
+  });
 }
 
 /**
  * TIME-DRIVEN TRIGGER — run hourly.
  * Marks Open / In Progress / On Hold tickets as Overdue once past their due date + scheduled time.
+ * Writes all changed cells in a few calls (was 5 sheet calls per ticket).
  */
 function markOverdueTickets() {
-  var now = new Date();
-  rows(DB.TICKETS).forEach(function(t) {
-    if (['Open', 'In Progress', 'On Hold'].indexOf(t['Status']) === -1) return;
-    if (!t['Due Date']) return;
-    var due = parseDate(t['Due Date']);
-    var tm = (t['Scheduled Time'] || '23:59').split(':');
-    due.setHours(Number(tm[0]) || 23, Number(tm[1]) || 59, 0, 0);
-    if (now > due) {
-      updateRowObj(DB.TICKETS, t._row, { 'Status': 'Overdue', 'Updated Date': nowStamp() });
-      logActivity(t['Ticket ID'], 'Scheduler', t['Status'], 'Overdue', 'Ticket passed its due date without completion');
+  return withLock(30000, function() {
+    var now = new Date();
+    var hits = [];
+    rows(DB.TICKETS).forEach(function(t) {
+      if (['Open', 'In Progress', 'On Hold'].indexOf(t['Status']) === -1) return;
+      if (!t['Due Date']) return;
+      var due = parseDate(t['Due Date']);
+      var tm = (t['Scheduled Time'] || '23:59').split(':');
+      due.setHours(Number(tm[0]) || 23, Number(tm[1]) || 59, 0, 0);
+      if (now > due) hits.push(t);
+    });
+    if (!hits.length) return 0;
+
+    var sh = sheet(DB.TICKETS), head = HEADERS[DB.TICKETS];
+    var statusCol = colLetter(head.indexOf('Status') + 1), updCol = colLetter(head.indexOf('Updated Date') + 1);
+    var stamp = nowStamp();
+    for (var i = 0; i < hits.length; i += 200) {
+      var part = hits.slice(i, i + 200);
+      sh.getRangeList(part.map(function(t) { return statusCol + t._row; })).setValue('Overdue');
+      sh.getRangeList(part.map(function(t) { return updCol + t._row; })).setValue(stamp);
     }
+    var actIds = nextIds('ACT-', 'seq_activity', 50001, hits.length);
+    appendRowsObj(DB.ACTIVITY, hits.map(function(t, i) {
+      return activityRow(actIds[i], t['Ticket ID'], 'Scheduler', t['Status'], 'Overdue', 'Ticket passed its due date without completion');
+    }));
+    forget(DB.TICKETS); bumpVersion();
+    return hits.length;
   });
 }
 
-function parseDate(s) {
-  var p = String(s).split('-');
-  return new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2] || 1));
+/**
+ * OPTIONAL TIME-DRIVEN TRIGGER — run monthly (or by hand).
+ * Moves Completed / Cancelled tickets scheduled more than ARCHIVE_AFTER_DAYS ago to the "Tickets Archive" tab,
+ * so the live Tickets tab stays small and every screen stays fast. Reports still include archived tickets.
+ * The activity log is left untouched.
+ */
+function archiveOldTickets() {
+  var days = Number(settingsMap()['ARCHIVE_AFTER_DAYS']) || 120;
+  var cutoff = dateMinus(days);
+  var head = HEADERS[DB.TICKETS];
+  return withLock(120000, function() {
+    var sh = sheet(DB.TICKETS);
+    var arch = sheet(DB.ARCHIVE);
+    if (!arch) {
+      arch = ss().insertSheet(DB.ARCHIVE);
+      arch.appendRow(head);
+      arch.getRange(1, 1, 1, head.length).setFontWeight('bold').setBackground('#EEF1F4');
+      arch.setFrozenRows(1);
+      arch.getRange('J:L').setNumberFormat('@'); arch.getRange('N:P').setNumberFormat('@');
+    }
+    var last = sh.getLastRow();
+    if (last < 2) return 0;
+    var data = sh.getRange(2, 1, last - 1, head.length).getValues();
+    var sCol = head.indexOf('Status'), dCol = head.indexOf('Scheduled Date');
+    var keep = [], move = [];
+    for (var i = 0; i < data.length; i++) {
+      var r = data[i];
+      if (r[0] === '') continue;
+      var st = String(r[sCol]), sd = normalize(r[dCol]);
+      if ((st === 'Completed' || st === 'Cancelled') && sd && sd < cutoff) move.push(r); else keep.push(r);
+    }
+    if (!move.length) return 0;
+    // 1) copy to the archive first, 2) rewrite the live tab, 3) clear the leftover rows — data is never only "in flight"
+    arch.getRange(arch.getLastRow() + 1, 1, move.length, head.length).setValues(move);
+    if (keep.length) sh.getRange(2, 1, keep.length, head.length).setValues(keep);
+    if (last - 1 > keep.length) sh.getRange(keep.length + 2, 1, last - 1 - keep.length, head.length).clearContent();
+    forget(DB.TICKETS); forget(DB.ARCHIVE); bumpVersion();
+    console.log('Archived ' + move.length + ' tickets scheduled before ' + cutoff);
+    return move.length;
+  });
 }
 
 /* ============================================================
  * EOD WORK LOGS
+ * The EOD tab is append-mostly and holds long text, so it is read from the bottom up.
  * ============================================================ */
+function activeEmployeeCount() {
+  return rows(DB.USERS).filter(function(u) { return u['Status'] === 'Active'; }).length || 1;
+}
+
+/* All EOD rows dated on/after `fromDate`, reading only the bottom of the tab whenever that is enough. */
+function eodRows(fromDate) {
+  var days = Math.max(1, Math.round((parseDate(today()) - parseDate(fromDate)) / 86400000) + 1);
+  var tail = rowsTail(DB.EOD, Math.max(300, activeEmployeeCount() * days * 2));
+  if (tail.length && tail[0]._row > 2 && tail[0]['Date'] >= fromDate) return rows(DB.EOD);   // tail did not reach back far enough
+  return tail.filter(function(r) { return r['Date'] >= fromDate; });
+}
+
+/* Light index of EOD logs (who + date only, no text). `tailCount` limits it to the bottom rows. */
+function eodIndex(tailCount) {
+  var sh = sheet(DB.EOD);
+  var last = sh.getLastRow();
+  if (last < 2) return [];
+  var start = tailCount ? Math.max(2, last - tailCount + 1) : 2;
+  var data = sh.getRange(start, 2, last - start + 1, 3).getValues();      // Employee ID, Employee Name, Date
+  var out = [];
+  for (var i = 0; i < data.length; i++) {
+    if (data[i][0] === '') continue;
+    out.push({ id: String(data[i][0]), name: String(data[i][1]), date: normalize(data[i][2]) });
+  }
+  return out;
+}
+
 function submitEOD(user, p) {
   requireFields(p, ['workCompleted']);
   var date = p.date || today();
   var cutoff = settingsMap()['EOD_CUTOFF'] || '23:00';
-  var existing = rows(DB.EOD).filter(function(r) {
+  var existing = eodRows(date).filter(function(r) {
     return r['Employee ID'] === user.id && r['Date'] === date;
   })[0];
 
@@ -661,18 +963,31 @@ function submitEOD(user, p) {
   return { id: record['Log ID'], updated: false };
 }
 
+var MY_EOD_LIMIT = 60;
 function myEOD(user) {
-  var list = rows(DB.EOD).filter(function(r) { return r['Employee ID'] === user.id; });
-  list.sort(function(a, b) { return b['Date'].localeCompare(a['Date']); });
-  return list.map(cleanRow(DB.EOD));
+  return cached('eod|' + user.id + '|' + today(), function() {
+    var list = rowsTail(DB.EOD, Math.max(400, activeEmployeeCount() * (MY_EOD_LIMIT + 10)))
+      .filter(function(r) { return r['Employee ID'] === user.id; });
+    list.sort(function(a, b) { return b['Date'].localeCompare(a['Date']); });
+    return list.slice(0, MY_EOD_LIMIT).map(cleanRow(DB.EOD));
+  });
 }
 
+/**
+ * Team EOD logs (admin). Options: date (one day) · employee · days (default 30) · all
+ */
 function listAllEOD(user, p) {
-  var list = rows(DB.EOD);
-  if (p && p.date) list = list.filter(function(r) { return r['Date'] === p.date; });
-  if (p && p.employee) list = list.filter(function(r) { return r['Employee ID'] === p.employee; });
-  list.sort(function(a, b) { return b['Date'].localeCompare(a['Date']); });
-  return list.map(cleanRow(DB.EOD));
+  p = p || {};
+  var key = 'eodall|' + today() + '|' + JSON.stringify({ d: p.date || '', e: p.employee || '', n: Number(p.days) || 0, a: !!p.all });
+  return cached(key, function() {
+    var list;
+    if (p.date) list = eodRows(p.date).filter(function(r) { return r['Date'] === p.date; });
+    else if (p.all) list = rows(DB.EOD);
+    else list = eodRows(dateMinus(Number(p.days) || 30));
+    if (p.employee) list = list.filter(function(r) { return r['Employee ID'] === p.employee; });
+    list.sort(function(a, b) { return b['Date'].localeCompare(a['Date']); });
+    return list.map(cleanRow(DB.EOD));
+  });
 }
 
 function cleanRow(sheetName) {
@@ -680,7 +995,62 @@ function cleanRow(sheetName) {
 }
 
 /* ============================================================
- * KPIs & REPORTS
+ * DASHBOARD — one call, everything the dashboard shows
+ * ============================================================ */
+function dashboard(user) {
+  var isAdmin = user.role === 'Admin';
+  var t = today();
+  return cached('dash|' + (isAdmin ? 'admin' : user.id) + '|' + t, function() {
+    var live = scopeTickets(user).filter(function(x) { return x['Status'] !== 'Cancelled'; });
+    var counts = { total: live.length, open: 0, inProgress: 0, onHold: 0, overdue: 0, completed: 0 };
+    var tickets = [];
+    var weekFrom = dateMinus(6), week = {};
+    for (var i = 0; i < live.length; i++) {
+      var x = live[i], s = x['Status'], sd = x['Scheduled Date'];
+      if (s === 'Open') counts.open++;
+      else if (s === 'In Progress') counts.inProgress++;
+      else if (s === 'On Hold') counts.onHold++;
+      else if (s === 'Overdue') counts.overdue++;
+      else if (s === 'Completed') counts.completed++;
+      if (ACTIVE[s] || sd === t) tickets.push(slimTicket(x));          // only what the dashboard actually shows
+      if (isAdmin && sd >= weekFrom && sd <= t) {
+        var w = week[sd] || (week[sd] = { total: 0, completed: 0 });
+        w.total++;
+        if (s === 'Completed') w.completed++;
+      }
+    }
+    tickets.sort(bySchedule);
+
+    var out = { today: t, settings: settingsMap(), counts: counts, tickets: tickets };
+    var users = rows(DB.USERS);
+    var todayLogs = eodIndex(Math.max(300, users.length * 3)).filter(function(r) { return r.date === t; });
+    var submitted = {};
+    todayLogs.forEach(function(r) { submitted[r.id] = 1; });
+
+    if (isAdmin) {
+      out.users = users.map(publicUser);
+      out.eod = {
+        submitted: todayLogs.length,
+        submittedToday: !!submitted[user.id],
+        pending: users.filter(function(u) { return u['Role'] === 'Employee' && u['Status'] === 'Active' && !submitted[u['User ID']]; })
+          .map(function(u) { return u['Name']; })
+      };
+      out.weekSeries = [];
+      for (var k = 6; k >= 0; k--) {
+        var d = new Date(); d.setDate(d.getDate() - k);
+        var ds = Utilities.formatDate(d, TZ, 'yyyy-MM-dd');
+        var w2 = week[ds] || { total: 0, completed: 0 };
+        out.weekSeries.push({ date: Utilities.formatDate(d, TZ, 'dd MMM'), total: w2.total, completed: w2.completed });
+      }
+    } else {
+      out.eod = { submittedToday: !!submitted[user.id] };
+    }
+    return out;
+  });
+}
+
+/* ============================================================
+ * KPIs & REPORTS (adminKPIs / employeeKPIs are kept for older front-ends; the app now uses `dashboard`)
  * ============================================================ */
 function countBy(list, field) {
   var m = {};
@@ -689,74 +1059,39 @@ function countBy(list, field) {
 }
 
 function adminKPIs(user) {
+  var d = dashboard(user), c = d.counts;
   var all = rows(DB.TICKETS).filter(function(t) { return t['Status'] !== 'Cancelled'; });
-  var t = today();
-  var todays = all.filter(function(x) { return x['Scheduled Date'] === t; });
-  var completed = all.filter(function(x) { return x['Status'] === 'Completed'; }).length;
-  var users = rows(DB.USERS).filter(function(u) { return u['Role'] === 'Employee' && u['Status'] === 'Active'; });
-  var eodToday = rows(DB.EOD).filter(function(r) { return r['Date'] === t; });
-  var submittedIds = eodToday.map(function(r) { return r['Employee ID']; });
-
-  // last 7 days completion series
-  var series = [];
-  for (var i = 6; i >= 0; i--) {
-    var d = new Date(); d.setDate(d.getDate() - i);
-    var ds = Utilities.formatDate(d, TZ, 'yyyy-MM-dd');
-    var day = all.filter(function(x) { return x['Scheduled Date'] === ds; });
-    series.push({
-      date: Utilities.formatDate(d, TZ, 'dd MMM'),
-      total: day.length,
-      completed: day.filter(function(x) { return x['Status'] === 'Completed'; }).length
-    });
-  }
-
-  var userNames = {};
-  rows(DB.USERS).forEach(function(u) { userNames[u['User ID']] = u['Name']; });
+  var names = {};
+  rows(DB.USERS).forEach(function(u) { names[u['User ID']] = u['Name']; });
   var byEmp = {};
-  all.forEach(function(x) {
-    var n = userNames[x['Assigned To']] || x['Assigned To'];
-    byEmp[n] = (byEmp[n] || 0) + 1;
-  });
-
+  all.forEach(function(x) { var n = names[x['Assigned To']] || x['Assigned To']; byEmp[n] = (byEmp[n] || 0) + 1; });
   return {
-    total: all.length,
-    open: all.filter(function(x) { return x['Status'] === 'Open'; }).length,
-    inProgress: all.filter(function(x) { return x['Status'] === 'In Progress'; }).length,
-    completed: completed,
-    overdue: all.filter(function(x) { return x['Status'] === 'Overdue'; }).length,
-    onHold: all.filter(function(x) { return x['Status'] === 'On Hold'; }).length,
-    todayTotal: todays.length,
-    pending: all.length - completed,
-    completionRate: all.length ? Math.round(completed / all.length * 100) : 0,
-    byStatus: countBy(all, 'Status'),
-    byPriority: countBy(all, 'Priority'),
-    byEmployee: byEmp,
-    weekSeries: series,
-    eodSubmitted: submittedIds.length,
-    eodSubmittedToday: !!user && submittedIds.indexOf(user.id) !== -1,
-    eodPending: users.filter(function(u) { return submittedIds.indexOf(u['User ID']) === -1; }).map(function(u) { return u['Name']; })
+    total: c.total, open: c.open, inProgress: c.inProgress, completed: c.completed, overdue: c.overdue, onHold: c.onHold,
+    todayTotal: d.tickets.filter(function(x) { return x['Scheduled Date'] === d.today; }).length,
+    pending: c.total - c.completed,
+    completionRate: c.total ? Math.round(c.completed / c.total * 100) : 0,
+    byStatus: countBy(all, 'Status'), byPriority: countBy(all, 'Priority'), byEmployee: byEmp,
+    weekSeries: d.weekSeries,
+    eodSubmitted: d.eod.submitted, eodSubmittedToday: d.eod.submittedToday, eodPending: d.eod.pending
   };
 }
 
 function employeeKPIs(user) {
-  var mine = scopeTickets(user).filter(function(t) { return t['Status'] !== 'Cancelled'; });
-  var t = today();
-  var eod = rows(DB.EOD).filter(function(r) { return r['Employee ID'] === user.id && r['Date'] === t; })[0];
+  var d = dashboard(user), c = d.counts;
   return {
-    total: mine.length,
-    open: mine.filter(function(x) { return x['Status'] === 'Open'; }).length,
-    inProgress: mine.filter(function(x) { return x['Status'] === 'In Progress'; }).length,
-    completed: mine.filter(function(x) { return x['Status'] === 'Completed'; }).length,
-    overdue: mine.filter(function(x) { return x['Status'] === 'Overdue'; }).length,
-    dueToday: mine.filter(function(x) { return x['Scheduled Date'] === t && x['Status'] !== 'Completed'; }).length,
-    eodSubmittedToday: !!eod
+    total: c.total, open: c.open, inProgress: c.inProgress, completed: c.completed, overdue: c.overdue,
+    dueToday: d.tickets.filter(function(x) { return x['Scheduled Date'] === d.today && x['Status'] !== 'Completed'; }).length,
+    eodSubmittedToday: d.eod.submittedToday
   };
 }
 
 function reportData(p) {
   var from = p.from || '0000-00-00';
   var to = p.to || '9999-12-31';
-  var all = rows(DB.TICKETS).filter(function(t) {
+  var source = rows(DB.TICKETS);
+  // include archived tickets when the period reaches back into the archive
+  if (sheet(DB.ARCHIVE) && from < dateMinus(Number(settingsMap()['ARCHIVE_AFTER_DAYS']) || 120)) source = source.concat(rows(DB.ARCHIVE));
+  var all = source.filter(function(t) {
     return t['Status'] !== 'Cancelled' && t['Scheduled Date'] >= from && t['Scheduled Date'] <= to;
   });
   if (p.department) all = all.filter(function(t) { return t['Department'] === p.department; });
@@ -783,7 +1118,9 @@ function reportData(p) {
     if (t['Status'] === 'Completed') perDept[d].completed++;
   });
 
-  var eod = rows(DB.EOD).filter(function(r) { return r['Date'] >= from && r['Date'] <= to; });
+  var eod = eodIndex().filter(function(r) { return r.date >= from && r.date <= to; });
+  var eodCount = {};
+  eod.forEach(function(r) { eodCount[r.id] = (eodCount[r.id] || 0) + 1; });
   var activeEmp = users.filter(function(u) { return u['Role'] === 'Employee' && u['Status'] === 'Active'; });
 
   var completed = all.filter(function(t) { return t['Status'] === 'Completed'; }).length;
@@ -803,9 +1140,7 @@ function reportData(p) {
     eod: {
       totalEmployees: activeEmp.length,
       logsSubmitted: eod.length,
-      perEmployee: activeEmp.map(function(u) {
-        return { name: u['Name'], submitted: eod.filter(function(r) { return r['Employee ID'] === u['User ID']; }).length };
-      })
+      perEmployee: activeEmp.map(function(u) { return { name: u['Name'], submitted: eodCount[u['User ID']] || 0 }; })
     }
   };
 }
@@ -813,17 +1148,18 @@ function reportData(p) {
 /* ============================================================
  * USERS & SETTINGS (Admin)
  * ============================================================ */
+function publicUser(u) {
+  return { id: u['User ID'], name: u['Name'], email: u['Email'], role: u['Role'], department: u['Department'], status: u['Status'], created: u['Created Date'] };
+}
+
 function listUsers() {
-  return rows(DB.USERS).map(function(u) {
-    return { id: u['User ID'], name: u['Name'], email: u['Email'], role: u['Role'], department: u['Department'], status: u['Status'], created: u['Created Date'] };
-  });
+  return rows(DB.USERS).map(publicUser);
 }
 
 function addUser(p) {
   requireFields(p, ['name', 'email', 'role', 'code']);
   var email = String(p.email).trim().toLowerCase();
-  var dup = rows(DB.USERS).filter(function(u) { return String(u['Email']).trim().toLowerCase() === email; })[0];
-  if (dup) throw new Error('!A user with this email already exists.');
+  if (findUserByEmail(email)) throw new Error('!A user with this email already exists.');
   var id = nextId('USR-', 'seq_user', 1002);
   appendRowObj(DB.USERS, {
     'User ID': id, 'Name': p.name, 'Email': p.email, 'Role': p.role,

@@ -51,9 +51,11 @@ In the Apps Script editor, open **Triggers (clock icon) → Add Trigger**, twice
 |---|---|---|
 | `dailyScheduler` | Time-driven | Day timer · **5am–6am** |
 | `markOverdueTickets` | Time-driven | Hour timer · **Every hour** |
+| `archiveOldTickets` (optional) | Time-driven | Month timer · **1st of the month** |
 
 - `dailyScheduler` reads every **Active** recurring template, generates today's tickets, and skips anything already generated (duplicate-proof).
-- `markOverdueTickets` flips Open / In Progress / On Hold tickets to **Overdue** once past their due date + scheduled time, and logs the change to Ticket Activity.
+- `markOverdueTickets` flips Open / In Progress / On Hold tickets to **Overdue** once past their due date + scheduled time, and logs the change to Ticket Activity. All changes are written in a handful of calls, however many tickets are late.
+- `archiveOldTickets` moves Completed / Cancelled tickets scheduled more than `ARCHIVE_AFTER_DAYS` days ago (default 120) into a **Tickets Archive** tab. This keeps the live Tickets tab small so every screen stays fast. Reports still include archived tickets; the ticket list and dashboard do not show them.
 
 ## 5. User management
 
@@ -90,6 +92,7 @@ Admin → **Settings** in the app, or edit the Settings tab directly:
 | `DEPARTMENTS` | Comma-separated departments |
 | `FREQUENCIES` | Ticket types |
 | `APP_NAME` | Display name |
+| `ARCHIVE_AFTER_DAYS` | Age (days) after which finished tickets are moved to the archive by `archiveOldTickets` |
 
 ## 9. Security model
 
@@ -102,7 +105,17 @@ Admin → **Settings** in the app, or edit the Settings tab directly:
 
 In-app notifications (new ticket, due soon, overdue, EOD pending) are derived automatically. To add email later, drop a `MailApp.sendEmail(...)` call inside `createTicket`, `generateForDate`, or `markOverdueTickets` in `Code.gs` — user emails are already in the Users sheet. For WhatsApp, call a provider API (e.g., a WhatsApp Business API vendor) with `UrlFetchApp` from the same places.
 
-## 11. Troubleshooting
+## 11. Upgrading an existing installation to the fast version
+
+1. Apps Script editor: replace the whole of `Code.gs` with the new file. Run `setupDatabase` once — it only adds what is missing (the `ARCHIVE_AFTER_DAYS` setting and the archive tab).
+2. If the Tickets tab already holds thousands of rows, run `archiveOldTickets` once from the editor.
+3. Deploy → Manage deployments → edit → New version → Deploy.
+4. Upload the new `script.js` to your host. Everyone presses Ctrl+F5 once.
+5. Add the optional monthly `archiveOldTickets` trigger.
+
+The old and new front end and back end are compatible in both directions, so the order of steps 3 and 4 does not matter.
+
+## 12. Troubleshooting
 
 | Symptom | Fix |
 |---|---|
@@ -111,3 +124,4 @@ In-app notifications (new ticket, due soon, overdue, EOD pending) are derived au
 | Recurring tickets not appearing | Confirm the `dailyScheduler` trigger exists, the template is `Active`, and today is inside its start/end window |
 | Times look wrong | Set the Apps Script project timezone (step 2.3) and redeploy |
 | Changes to Code.gs not taking effect | You must deploy a **New version** (step 3.6) |
+| Dashboard slow, times out, or shows "The backend is busy" | Run `archiveOldTickets` from the editor and add its monthly trigger. Confirm the app is on the v2 `Code.gs` (it has a `dashboard` function) and a new version was deployed |

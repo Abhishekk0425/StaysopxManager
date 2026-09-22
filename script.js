@@ -72,32 +72,83 @@ function serverCheckHtml() {
     '“Authorization is required”, or an error) means the Apps Script has to be fixed, not this page.</span>';
 }
 
+/* Give up on a request after this long instead of leaving the page "loading" forever */
+var API_TIMEOUT_MS = 45000;
+/* Read-only actions: safe to retry once, and identical calls made at the same moment share one request */
+var READ_ACTIONS = { dashboard: 1, listTickets: 1, getTicket: 1, listRecurring: 1, listUsers: 1, myEOD: 1, listAllEOD: 1, reportData: 1, bootstrap: 1, adminKPIs: 1, employeeKPIs: 1 };
+var _pending = {};
+
 async function api(action, payload) {
   if (CONFIG.API_URL.indexOf('http') !== 0) {
     throw new Error('Backend not configured. Paste your Apps Script URL into CONFIG.API_URL in script.js.');
   }
-  var out, res;
+  var isRead = !!READ_ACTIONS[action];
+  var key = isRead ? action + ':' + JSON.stringify(payload || {}) : null;
+  if (key && _pending[key]) return _pending[key];          // same read already running — reuse it
+
+  var run = (async function() {
+    try {
+      var data = await apiOnce(action, payload);
+      if (!isRead) state.dash = null;                      // a write happened: never repaint from the old dashboard reply
+      return data;
+    } catch (e) {
+      // one quiet retry for reads when Google stumbled (busy, cold start, network blip)
+      if (isRead && (e.code === 'NO_SERVER' || e.code === 'BAD_REPLY' || e.code === 'BUSY' || e.code === 'TIMEOUT')) {
+        await new Promise(function(r) { setTimeout(r, 1500); });
+        return await apiOnce(action, payload);
+      }
+      throw e;
+    }
+  })();
+  if (key) {
+    _pending[key] = run;
+    run.then(function() { delete _pending[key]; }, function() { delete _pending[key]; });
+  }
+  return run;
+}
+
+async function apiOnce(action, payload) {
+  var out, res, text;
+  var ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  var timer = ctrl ? setTimeout(function() { ctrl.abort(); }, API_TIMEOUT_MS) : null;
   setLoading(true);
   try {
     try {
       res = await fetch(CONFIG.API_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // avoids CORS preflight
-        body: JSON.stringify({ action: action, token: state.token, payload: payload || {} })
+        body: JSON.stringify({ action: action, token: state.token, payload: payload || {} }),
+        signal: ctrl ? ctrl.signal : undefined
       });
     } catch (e) {
+      if (e && e.name === 'AbortError') {
+        throw apiError('TIMEOUT', 'The backend took too long to answer. Please try again in a moment.');
+      }
       // Either there is no internet, or Google answered with an error page instead of the app
       // (the usual reason: the Apps Script was changed but not authorized / redeployed).
       throw apiError('NO_SERVER', navigator.onLine === false ?
         'You appear to be offline. Check your internet connection and try again.' :
         'The backend is not responding. If your internet is working, the Apps Script needs to be authorized or redeployed.');
     }
+    text = await res.text();
     try {
-      out = await res.json();
+      out = JSON.parse(text);
     } catch (e) {
+      // Google sends an HTML page instead of JSON when the script itself failed — say why when we can tell
+      var low = String(text || '').toLowerCase();
+      if (low.indexOf('simultaneous') !== -1 || low.indexOf('too many') !== -1) {
+        throw apiError('BUSY', 'The backend is busy — too many people loading at the same time. Please wait a moment and try again.');
+      }
+      if (low.indexOf('exceeded maximum execution time') !== -1) {
+        throw apiError('BUSY', 'The backend ran out of time building this page. Try again; if it keeps happening, run archiveOldTickets in the Apps Script editor.');
+      }
+      if (low.indexOf('authorization') !== -1 || low.indexOf('sign in') !== -1) {
+        throw apiError('BAD_REPLY', 'The backend is asking for authorization. Open the Apps Script, run any function once to authorize it, then deploy a new version.');
+      }
       throw apiError('BAD_REPLY', 'The backend replied with an error page instead of data. The Apps Script needs to be authorized or redeployed.');
     }
   } finally {
+    if (timer) clearTimeout(timer);
     setLoading(false);
   }
   if (!out.ok) {
@@ -140,6 +191,7 @@ async function doLogin() {
 function logout(expired) {
   ['od_token', 'od_user', 'od_settings'].forEach(function(k) { localStorage.removeItem(k); });
   state.token = null; state.user = null;
+  state.users = []; state.tickets = []; state.dash = null;
   closeProfile();
   document.getElementById('app').classList.add('hidden');
   document.getElementById('loginScreen').classList.remove('hidden');
@@ -276,12 +328,8 @@ async function enterApp() {
   document.getElementById('userAvatar').textContent = initials(state.user.name);
   document.getElementById('userAvatarLg').textContent = initials(state.user.name);
   buildSidebar();
+  // One request only: the dashboard reply also carries the settings and (for admins) the user list.
   navigate('dashboard');
-  try {
-    var boot = await api('bootstrap');
-    state.settings = boot.settings;
-    if (boot.users) state.users = boot.users;
-  } catch (e) { /* non-fatal */ }
 }
 
 /* ============================================================
@@ -384,12 +432,12 @@ async function renderView(silent) {
   c.classList.toggle('no-anim', silent);
   try {
     var v = state.view;
-    if (v === 'dashboard') await (state.user.role === 'Admin' ? renderAdminDashboard(c) : renderEmployeeDashboard(c));
+    if (v === 'dashboard') await (state.user.role === 'Admin' ? renderAdminDashboard(c, silent) : renderEmployeeDashboard(c, silent));
     else if (v === 'tickets') await renderTickets(c, state.viewArg || {});
-    else if (v === 'today') await renderTickets(c, { preset: 'today' });
-    else if (v === 'upcoming') await renderTickets(c, { preset: 'upcoming' });
-    else if (v === 'completed') await renderTickets(c, { preset: 'completed' });
-    else if (v === 'history') await renderTickets(c, { preset: 'history' });
+    else if (v === 'today') await renderTickets(c, Object.assign({ preset: 'today' }, state.viewArg || {}));
+    else if (v === 'upcoming') await renderTickets(c, Object.assign({ preset: 'upcoming' }, state.viewArg || {}));
+    else if (v === 'completed') await renderTickets(c, Object.assign({ preset: 'completed' }, state.viewArg || {}));
+    else if (v === 'history') await renderTickets(c, Object.assign({ preset: 'history' }, state.viewArg || {}));
     else if (v === 'createTicket') await renderCreateTicket(c);
     else if (v === 'recurring') await renderRecurring(c);
     else if (v === 'employees') await renderEmployees(c);
@@ -724,38 +772,62 @@ function isAfterFive() { return new Date().getHours() >= 17; }
  * VIEW — ADMIN DASHBOARD
  * Summary band · today rings · clickable KPIs · priority mix · overdue · team · coming up · 7-day trend
  * ============================================================ */
-async function renderAdminDashboard(c) {
-  var results = await Promise.all([
-    api('adminKPIs'), api('listTickets'),
-    state.users.length ? state.users : api('listUsers')
-  ]);
-  var k = results[0];
-  state.tickets = results[1];
-  state.users = results[2];
+/* The dashboard is ONE request ('dashboard'). The reply holds only what the page shows:
+ *   counts   — totals by status (over every ticket, computed on the server)
+ *   tickets  — unfinished tickets + everything scheduled today (no descriptions, no old completed work)
+ *   eod      — today's EOD status · weekSeries — last 7 days · users, settings — kept fresh for free
+ * The last reply is kept for 5 minutes, so coming back to the dashboard paints instantly and then refreshes quietly. */
+var DASH_CACHE_MS = 5 * 60 * 1000;
 
-  var t = todayStr();
-  var live = state.tickets.filter(function(x) { return x['Status'] !== 'Cancelled'; });
-  var count = function(s) { return live.filter(function(x) { return x['Status'] === s; }).length; };
+function dashCache() {
+  var d = state.dash;
+  return d && d.role === state.user.role && d.userId === state.user.id && (Date.now() - d.at) < DASH_CACHE_MS ? d.data : null;
+}
+function applyDashData(d) {
+  if (d.settings) {
+    state.settings = d.settings;
+    try { localStorage.setItem('od_settings', JSON.stringify(d.settings)); } catch (e) {}
+  }
+  if (d.users) state.users = d.users;
+  state.tickets = d.tickets || [];
+  state.dash = { role: state.user.role, userId: state.user.id, at: Date.now(), data: d };
+}
+async function loadDashboard(c, silent, paint) {
+  var cachedData = silent ? null : dashCache();
+  if (cachedData) paint(c, cachedData);                       // instant paint from the last load
+  var d = await api('dashboard');
+  var unchanged = cachedData && JSON.stringify(d) === JSON.stringify(cachedData);
+  applyDashData(d);
+  if (!unchanged) paint(c, d);
+}
+async function renderAdminDashboard(c, silent) { await loadDashboard(c, silent, paintAdminDashboard); }
+async function renderEmployeeDashboard(c, silent) { await loadDashboard(c, silent, paintEmployeeDashboard); }
+
+function paintAdminDashboard(c, d) {
+  destroyCharts();
+  var k = d.counts, e = d.eod;
+  var t = d.today || todayStr();
+  var live = d.tickets;                                         // unfinished + scheduled today; cancelled already excluded
   var overdue = live.filter(function(x) { return x['Status'] === 'Overdue'; }).sort(oldestFirst);
   computeNotifs(overdue);
 
   var todays = live.filter(function(x) { return x['Scheduled Date'] === t; });
   var todayDone = todays.filter(function(x) { return x['Status'] === 'Completed'; }).length;
-  var completed = count('Completed');
+  var completed = k.completed;
   var urgent = overdue.filter(function(x) { return x['Priority'] === 'High' || x['Priority'] === 'Critical'; }).length;
   var comingUp = todays.filter(function(x) { return isPendingStatus(x['Status']); }).sort(byTimeToday);
 
   /* --- EOD today --- */
-  var eodTotal = k.eodSubmitted + k.eodPending.length;
-  var waiting = k.eodPending.slice(0, 8).map(esc).join(', ') +
-    (k.eodPending.length > 8 ? ' +' + (k.eodPending.length - 8) + ' more' : '');
+  var eodTotal = e.submitted + e.pending.length;
+  var waiting = e.pending.slice(0, 8).map(esc).join(', ') +
+    (e.pending.length > 8 ? ' +' + (e.pending.length - 8) + ' more' : '');
 
   /* --- one-line summary --- */
   var bits = [];
   bits.push(overdue.length ? '<strong>' + plural(overdue.length, 'ticket is', 'tickets are') + ' overdue</strong>' +
     (urgent ? ' (' + urgent + ' high or critical)' : '') : 'Nothing is overdue');
   bits.push(todays.length ? todayDone + ' of ' + todays.length + ' scheduled today ' + (todayDone === 1 && todays.length === 1 ? 'is' : 'are') + ' done' : 'nothing is scheduled today');
-  if (isAfterFive() && k.eodPending.length) bits.push(plural(k.eodPending.length, 'EOD log is', 'EOD logs are') + ' still pending');
+  if (isAfterFive() && e.pending.length) bits.push(plural(e.pending.length, 'EOD log is', 'EOD logs are') + ' still pending');
   var summary = bits.join(' · ') + '.';
 
   /* --- active work by priority --- */
@@ -790,7 +862,7 @@ async function renderAdminDashboard(c) {
   c.innerHTML =
     heroBand(summary,
       '<button class="btn btn-primary" onclick="navigate(\'createTicket\')">' + icon('plus', 16) + 'New ticket</button>' +
-      eodActionBtn(k.eodSubmittedToday)) +
+      eodActionBtn(e.submittedToday)) +
 
     /* today strip */
     '<div class="two-col">' +
@@ -802,18 +874,18 @@ async function renderAdminDashboard(c) {
 
       '<div class="panel"><div class="panel-head"><h3>EOD logs today</h3>' +
         '<button class="btn btn-ghost btn-sm" onclick="navigate(\'eodAdmin\')">View logs</button></div>' +
-        '<div class="ring-row">' + progressRing(k.eodSubmitted, eodTotal) + '<div>' +
-        '<div class="progress-num"><span data-count="' + k.eodSubmitted + '">' + k.eodSubmitted + '</span> <small>of ' + eodTotal + ' submitted</small></div>' +
-        '<p class="muted small">' + (k.eodPending.length ? 'Waiting on: ' + waiting : 'Everyone has submitted.') + '</p></div></div></div>' +
+        '<div class="ring-row">' + progressRing(e.submitted, eodTotal) + '<div>' +
+        '<div class="progress-num"><span data-count="' + e.submitted + '">' + e.submitted + '</span> <small>of ' + eodTotal + ' submitted</small></div>' +
+        '<p class="muted small">' + (e.pending.length ? 'Waiting on: ' + waiting : 'Everyone has submitted.') + '</p></div></div></div>' +
     '</div>' +
 
     /* KPIs — click any card to open that list */
     '<div class="kpi-grid kpi-fit">' +
       kpiCard('Overdue', overdue.length, 'k-late k-accent', urgent ? urgent + ' high or critical' : '', 'status', 'Overdue', 'alert') +
-      kpiCard('Open', count('Open'), 'k-open', 'Not started', 'status', 'Open', 'dot') +
-      kpiCard('In progress', count('In Progress'), 'k-progress', '', 'status', 'In Progress', 'activity') +
-      kpiCard('On hold', count('On Hold'), 'k-hold', '', 'status', 'On Hold', 'pause') +
-      kpiCard('Completion rate', pctOf(completed, live.length) + '%', 'k-done', completed + ' of ' + live.length + ' tickets', 'status', 'Completed', 'target') +
+      kpiCard('Open', k.open, 'k-open', 'Not started', 'status', 'Open', 'dot') +
+      kpiCard('In progress', k.inProgress, 'k-progress', '', 'status', 'In Progress', 'activity') +
+      kpiCard('On hold', k.onHold, 'k-hold', '', 'status', 'On Hold', 'pause') +
+      kpiCard('Completion rate', pctOf(completed, k.total) + '%', 'k-done', completed + ' of ' + k.total + ' tickets', 'status', 'Completed', 'target') +
     '</div>' +
 
     /* priority mix of everything still active */
@@ -847,7 +919,7 @@ async function renderAdminDashboard(c) {
           '<div class="table-wrap scroll-y"><table class="compact"><thead><tr><th>Employee</th><th>Today</th><th>Pending</th><th>Overdue</th><th>EOD</th></tr></thead><tbody>' +
           teamRows.map(function(m) {
             var eod = !m.isEmp ? '<span class="muted small">—</span>' :
-              (k.eodPending.indexOf(m.name) === -1 ? '<span class="badge b-done">Submitted</span>' : '<span class="badge b-progress">Pending</span>');
+              (e.pending.indexOf(m.name) === -1 ? '<span class="badge b-done">Submitted</span>' : '<span class="badge b-progress">Pending</span>');
             return '<tr class="clickable" onclick="goTickets(\'employee\',\'' + esc(m.id) + '\')">' +
               '<td class="t-title">' + esc(m.name) + '</td>' +
               '<td class="small mono">' + (m.today ? m.todayDone + '/' + m.today + progressBar(m.todayDone, m.today, true) : '<span class="muted">—</span>') + '</td>' +
@@ -882,10 +954,10 @@ async function renderAdminDashboard(c) {
   makeChart('chWeek', {
     type: 'bar',
     data: {
-      labels: k.weekSeries.map(function(d) { return d.date; }),
+      labels: (d.weekSeries || []).map(function(w) { return w.date; }),
       datasets: [
-        { label: 'Completed', data: k.weekSeries.map(function(d) { return d.completed; }), backgroundColor: cssVar('--done'), maxBarThickness: 40, borderRadius: 4 },
-        { label: 'Not completed', data: k.weekSeries.map(function(d) { return d.total - d.completed; }), backgroundColor: cssVar('--bar-rest'), maxBarThickness: 40, borderRadius: 4 }
+        { label: 'Completed', data: (d.weekSeries || []).map(function(w) { return w.completed; }), backgroundColor: cssVar('--done'), maxBarThickness: 40, borderRadius: 4 },
+        { label: 'Not completed', data: (d.weekSeries || []).map(function(w) { return w.total - w.completed; }), backgroundColor: cssVar('--bar-rest'), maxBarThickness: 40, borderRadius: 4 }
       ]
     },
     options: {
@@ -899,15 +971,12 @@ async function renderAdminDashboard(c) {
  * VIEW — EMPLOYEE DASHBOARD
  * Summary band · today ring + next up · clickable KPIs · carried-over work · today's tasks
  * ============================================================ */
-async function renderEmployeeDashboard(c) {
-  var results = await Promise.all([api('employeeKPIs'), api('listTickets')]);
-  var k = results[0];
-  state.tickets = results[1];
-  computeNotifs(state.tickets, k.eodSubmittedToday);
-
-  var t = todayStr();
-  var mine = state.tickets.filter(function(x) { return x['Status'] !== 'Cancelled'; });
-  var count = function(s) { return mine.filter(function(x) { return x['Status'] === s; }).length; };
+function paintEmployeeDashboard(c, d) {
+  destroyCharts();
+  var k = d.counts, e = d.eod;
+  var t = d.today || todayStr();
+  var mine = d.tickets;                                         // my unfinished tickets + everything scheduled today
+  computeNotifs(mine, e.submittedToday);
 
   var todays = mine.filter(function(x) { return x['Scheduled Date'] === t; });
   todays.sort(function(a, b) { return (a['Scheduled Time'] || '99').localeCompare(b['Scheduled Time'] || '99'); });
@@ -930,13 +999,13 @@ async function renderEmployeeDashboard(c) {
   var bits = [];
   bits.push(todays.length ? (left ? '<strong>' + plural(left, 'task', 'tasks') + ' left today</strong>' : '<strong>All of today\'s tasks are done</strong>') : 'Nothing is scheduled for you today');
   if (carried.length) bits.push(plural(carried.length, 'task', 'tasks') + ' carried over from earlier days');
-  if (!k.eodSubmittedToday && isAfterFive()) bits.push('your EOD log is due by ' + cutoff);
+  if (!e.submittedToday && isAfterFive()) bits.push('your EOD log is due by ' + cutoff);
   var summary = bits.join(' · ') + '.';
 
   c.innerHTML =
     heroBand(summary,
       '<button class="btn btn-primary" onclick="navigate(\'createTicket\')">' + icon('plus', 16) + 'New ticket</button>' +
-      eodActionBtn(!!k.eodSubmittedToday)) +
+      eodActionBtn(!!e.submittedToday)) +
 
     '<div class="two-col">' +
       '<div class="panel"><div class="panel-head"><h3>Today\'s tasks</h3>' +
@@ -962,10 +1031,10 @@ async function renderEmployeeDashboard(c) {
     '</div>' +
 
     '<div class="kpi-grid kpi-fit">' +
-      kpiCard('Overdue', count('Overdue'), 'k-late k-accent', '', 'status', 'Overdue', 'alert') +
-      kpiCard('Open', count('Open'), 'k-open', 'Not started', 'status', 'Open', 'dot') +
-      kpiCard('In progress', count('In Progress'), 'k-progress', '', 'status', 'In Progress', 'activity') +
-      kpiCard('Completed', count('Completed'), 'k-done', 'of ' + mine.length + ' assigned', 'status', 'Completed', 'check') +
+      kpiCard('Overdue', k.overdue, 'k-late k-accent', '', 'status', 'Overdue', 'alert') +
+      kpiCard('Open', k.open, 'k-open', 'Not started', 'status', 'Open', 'dot') +
+      kpiCard('In progress', k.inProgress, 'k-progress', '', 'status', 'In Progress', 'activity') +
+      kpiCard('Completed', k.completed, 'k-done', 'of ' + k.total + ' assigned', 'status', 'Completed', 'check') +
     '</div>' +
 
     (carried.length ?
@@ -979,12 +1048,22 @@ async function renderEmployeeDashboard(c) {
 /* ============================================================
  * VIEW — TICKETS (shared list w/ search + filters)
  * ============================================================ */
+/* The list loads every unfinished ticket plus anything scheduled in the last TICKET_WINDOW_DAYS days.
+ * "Show older tickets" loads everything. Long lists are shown TICKET_PAGE rows at a time. */
+var TICKET_WINDOW_DAYS = 45;
+var TICKET_PAGE = 150;
+
 async function renderTickets(c, opts) {
-  state.tickets = await api('listTickets');
+  var o = opts || {};
   var isAdmin = state.user.role === 'Admin';
-  if (isAdmin && !state.users.length) {
-    try { state.users = await api('listUsers'); } catch (e) {}
-  }
+  var req = o.all ? { all: true } : { days: TICKET_WINDOW_DAYS };
+  var wait = [api('listTickets', req)];
+  if (isAdmin && !state.users.length) wait.push(api('listUsers').catch(function() { return []; }));
+  var got = await Promise.all(wait);
+  state.tickets = got[0];
+  if (got[1] && got[1].length) state.users = got[1];
+  state._ticketsAll = !!o.all;
+  state._ticketLimit = TICKET_PAGE;
   computeNotifs(state.tickets);
 
   var statuses = settingList('STATUSES', 'Open,In Progress,Completed,On Hold,Overdue');
@@ -1003,7 +1082,10 @@ async function renderTickets(c, opts) {
       '<input type="date" id="fDate" onchange="applyFilters()" title="Scheduled date">' +
       (isAdmin ? '<button class="btn btn-primary" onclick="navigate(\'createTicket\')">+ New ticket</button>' : '') +
     '</div>' +
-    '<div class="panel"><div id="ticketListBox"></div></div>';
+    '<div class="panel"><div id="ticketListBox"></div>' +
+    '<p class="muted small" style="margin-top:12px">' + (state._ticketsAll ? 'Showing all tickets.' :
+      'Showing unfinished tickets and everything scheduled in the last ' + TICKET_WINDOW_DAYS + ' days. ' +
+      '<button type="button" class="link-btn" onclick="loadAllTickets()">Show older tickets</button>') + '</p></div>';
 
   // presets for employee sub-views
   var preset = opts && opts.preset;
@@ -1058,7 +1140,19 @@ function applyFilters() {
     }
     return true;
   });
-  document.getElementById('ticketListBox').innerHTML = ticketsTable(list, state.user.role !== 'Admin');
+  var limit = state._ticketLimit || TICKET_PAGE;
+  document.getElementById('ticketListBox').innerHTML = ticketsTable(list.slice(0, limit), state.user.role !== 'Admin') +
+    (list.length > limit ?
+      '<div style="text-align:center;padding:14px 0 4px"><button class="btn btn-ghost btn-sm" onclick="moreTickets()">Show ' +
+      Math.min(TICKET_PAGE, list.length - limit) + ' more (' + (list.length - limit) + ' remaining)</button></div>' : '');
+}
+function moreTickets() {
+  state._ticketLimit = (state._ticketLimit || TICKET_PAGE) + TICKET_PAGE;
+  applyFilters();
+}
+function loadAllTickets() {
+  state.viewArg = Object.assign({}, state.viewArg || {}, { all: true });
+  renderView();
 }
 
 function ticketsTable(list, quickActions) {
@@ -1450,9 +1544,9 @@ async function toggleUser(id, status) {
  * VIEW — EOD (Employee)
  * ============================================================ */
 async function renderEmployeeEOD(c) {
-  var both = await Promise.all([api('myEOD'), api('listTickets')]);
-  var logs = both[0];
   var t = todayStr();
+  var both = await Promise.all([api('myEOD'), api('listTickets', { date: t })]);   // only today's tickets are needed here
+  var logs = both[0];
   // my own tickets for today (an admin's list holds everyone's, so filter to me)
   state._eodToday = both[1].filter(function(x) {
     return x['Assigned To'] === state.user.id && x['Scheduled Date'] === t && x['Status'] !== 'Cancelled';
@@ -1543,24 +1637,58 @@ async function saveEOD() {
 /* ============================================================
  * VIEW — EOD LOGS (Admin)
  * ============================================================ */
+/* Loads the last EOD_WINDOW_DAYS days. Picking an older date fetches just that day; "Show all logs" loads everything. */
+var EOD_WINDOW_DAYS = 30;
+
 async function renderAdminEOD(c) {
   loadUsersThen(async function() {
     try {
-      var logs = await api('listAllEOD', {});
+      var logs = await api('listAllEOD', { days: EOD_WINDOW_DAYS });
       state._eodLogs = logs;
+      state._eodAll = false;
+      state._eodFetched = {};
       c.innerHTML =
         '<div class="filter-bar">' +
         '<input type="date" id="eodDate" onchange="filterAdminEOD()">' +
         '<select id="eodEmp" onchange="filterAdminEOD()"><option value="">Employee: All</option>' + userOptions() + '</select>' +
+        '<span class="muted small" id="eodScope" style="flex:1">Showing the last ' + EOD_WINDOW_DAYS + ' days. ' +
+        '<button type="button" class="link-btn" onclick="loadAllEOD()">Show all logs</button></span>' +
         '</div><div id="eodListBox"></div>';
       filterAdminEOD();
     } catch (e) { c.innerHTML = errorState(e.message); }
   }, c);
 }
 
-function filterAdminEOD() {
+async function loadAllEOD() {
+  var box = document.getElementById('eodListBox');
+  box.innerHTML = '<div class="skeleton tall"></div>';
+  try {
+    state._eodLogs = await api('listAllEOD', { all: true });
+    state._eodAll = true;
+    document.getElementById('eodScope').textContent = 'Showing all logs.';
+    filterAdminEOD();
+  } catch (e) { box.innerHTML = errorState(e.message); }
+}
+
+function daysAgoStr(n) {
+  var d = new Date(); d.setDate(d.getDate() - n);
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+
+async function filterAdminEOD() {
   var d = document.getElementById('eodDate').value;
   var emp = document.getElementById('eodEmp').value;
+  // a date outside the loaded window: fetch that one day and merge it in
+  if (d && !state._eodAll && d < daysAgoStr(EOD_WINDOW_DAYS) && !state._eodFetched[d]) {
+    state._eodFetched[d] = true;
+    try {
+      var extra = await api('listAllEOD', { date: d });
+      var have = {};
+      state._eodLogs.forEach(function(l) { have[l['Log ID']] = true; });
+      extra.forEach(function(l) { if (!have[l['Log ID']]) state._eodLogs.push(l); });
+    } catch (e) { toast(e.message, 'error'); }
+    if (document.getElementById('eodDate').value !== d) return;      // the user moved on while we were loading
+  }
   var list = state._eodLogs.filter(function(l) {
     if (d && l['Date'] !== d) return false;
     if (emp && l['Employee ID'] !== emp) return false;
