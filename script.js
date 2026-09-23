@@ -3,7 +3,7 @@
  * Vanilla JS single-page app · Google Apps Script backend
  * ============================================================ */
 
-var FRONTEND_VERSION = 'v2.3.1';   // shown on the login screen; sent with every request so the backend knows what this page expects
+var FRONTEND_VERSION = 'v2.3.2';   // shown on the login screen; sent with every request so the backend knows what this page expects
 var CONFIG = {
   // Paste your Apps Script Web App URL here (ends in /exec)
   API_URL: 'https://script.google.com/macros/s/AKfycbyhbU_YmsETzJxY5YWoie5tGGvCSx-hpjUpd6MwDBTUzqJyUvfl3SyS8M7lxj_90MXVnQ/exec'
@@ -450,7 +450,11 @@ async function renderView(silent) {
     else if (v === 'settings') await renderSettings(c);
     if (!silent) animateCounts(c);
   } catch (e) {
-    if (!silent) c.innerHTML = errorState(e.message);
+    if (!silent) {
+      var unknown = e.code === 'UNKNOWN_ACTION';
+      c.innerHTML = errorState(unknown ? 'The backend this page is calling does not know the "' + esc(v) + '" request — it is running an older version of Code.gs. Details below.' : e.message, unknown);
+      if (unknown) fillSysReport('sysReport');
+    }
     else { state.charts = state.charts.concat(oldCharts); oldCharts = []; }   // failed quietly: leave the old page alone
   }
   oldCharts.forEach(function(ch) { try { ch.destroy(); } catch (e) {} });
@@ -500,9 +504,45 @@ function animateCounts(root) {
   requestAnimationFrame(frame);
 }
 
-function errorState(msg) {
+function errorState(msg, withReport) {
   return '<div class="empty-state"><div class="e-ico e-warn">' + icon('alert', 24) + '</div><p>' + esc(msg) + '</p>' +
-    '<button class="btn btn-ghost" style="margin-top:12px" onclick="renderView()">Try again</button></div>';
+    '<button class="btn btn-ghost" style="margin-top:12px" onclick="renderView()">Try again</button>' +
+    (withReport ? '<pre class="muted small" style="white-space:pre-wrap;text-align:left;margin-top:16px" id="sysReport">Checking the backend…</pre>' : '') + '</div>';
+}
+
+/* What this page is, where it runs from, which backend URL it calls, and what that URL answers.
+ * Shown automatically when the backend does not understand a request, and from "System check" on the login screen. */
+async function backendReport() {
+  var lines = [
+    'Page version: ' + FRONTEND_VERSION,
+    'Page loaded from: ' + location.href.split('?')[0].split('#')[0],
+    'Backend URL in this page: ' + CONFIG.API_URL
+  ];
+  try {
+    var res = await fetch(CONFIG.API_URL, { method: 'GET' });
+    var txt = await res.text();
+    try {
+      var j = JSON.parse(txt);
+      lines.push('That URL answers: "' + (j.data || JSON.stringify(j)) + '"');
+      if (!/v\d/.test(String(j.data || ''))) lines.push('=> This URL runs the ORIGINAL backend (no version). The new Code.gs is not deployed at this URL.');
+    } catch (e) {
+      lines.push('That URL answers with a web page, not data. Deployment access must be "Anyone" and Execute as "Me".');
+    }
+  } catch (e) { lines.push('That URL could not be reached: ' + e.message); }
+  var c = state.lastCall;
+  if (c && c.version) lines.push('Last data reply came from backend ' + c.version);
+  return lines.join('\n');
+}
+async function fillSysReport(id) {
+  var el = document.getElementById(id);
+  if (!el) return;
+  try { el.textContent = await backendReport(); } catch (e) { el.textContent = 'Check failed: ' + e.message; }
+}
+async function loginSystemCheck() {
+  var el = document.getElementById('loginError');
+  el.textContent = 'Checking…';
+  el.style.whiteSpace = 'pre-wrap'; el.style.textAlign = 'left';
+  el.textContent = await backendReport();
 }
 
 /* ============================================================
@@ -1892,8 +1932,10 @@ document.getElementById('loginCode').addEventListener('keydown', function(e) {
   });
 });
 applyTheme(currentTheme());
-(function() {   // version on the login screen, so it is obvious which page the browser is running
+(function() {   // version + a self-check on the login screen, so it is obvious which page the browser is running
   var brand = document.querySelector('.login-brand p');
   if (brand) brand.textContent += ' · app ' + FRONTEND_VERSION;
+  var help = document.querySelector('.login-help');
+  if (help) help.innerHTML += ' · <button type="button" class="link-btn" onclick="loginSystemCheck()">System check</button>';
 })();
 if (state.token && state.user) enterApp();
